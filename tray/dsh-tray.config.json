@@ -10,5 +10,8 @@
   "startTimeoutSeconds": 90,
   "stopTimeoutSeconds": 25,
   "pollSeconds": 3,
-  "focusBrowser": true
+  "focusBrowser": true,
+  "stopOnExit": true,
+  "exitStopTimeoutSeconds": 10,
+  "prewarmPanel": true
 }

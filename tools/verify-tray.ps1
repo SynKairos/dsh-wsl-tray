@@ -66,9 +66,10 @@ if ($nonAscii -ne 0) { $fail++ }
 try {
   $L = Get-Content -Raw -Encoding UTF8 $json | ConvertFrom-Json
   $need = @('appName', 'tooltip', 'windowMarker', 'menuOpen', 'menuRestart', 'menuStop', 'menuLog',
-    'menuExit', 'statusRunning', 'statusStopped', 'statusStarting', 'statusStopping', 'statusFailed',
+    'statusRunning', 'statusStopped', 'statusStarting', 'statusStopping', 'statusFailed',
     'statusStopFailed', 'hintPortBusy', 'hintStartFail', 'hintStopFail', 'hintNoToken',
-    'hintLinger', 'hintNoUnit', 'confirmStop', 'confirmRestart')
+    'hintLinger', 'hintNoUnit',
+    'confirmStopHint', 'confirmOk', 'confirmRestartHint', 'confirmRestartOk', 'confirmCancel')
   $miss = @()
   foreach ($k in $need) { if (-not $L.$k) { $miss += $k } }
   if ($miss.Count -gt 0) { Check ('labels=MISSING ' + ($miss -join ',')); $fail++ }

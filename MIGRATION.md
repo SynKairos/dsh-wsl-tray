@@ -45,7 +45,7 @@ pwsh -ExecutionPolicy Bypass -File tools\switch.ps1           # 备份 → 安�
 
 1. 把现有 `%LOCALAPPDATA%\dsh` 下的脚本/文案/配置和 `~/bin/dsh-*.sh` 备份到
    `%LOCALAPPDATA%\dsh\backup\<时间戳>\`；
-2. 调 `tools/install.ps1`（复制托盘文件、WSL 脚本、unit，`enable-linger`，`enable` unit）；
+2. 调 `tools/install.ps1`（复制托盘文件、WSL 脚本、unit，`enable-linger`，unit 保持 `disable`）；
 3. 结束旧托盘进程；
 4. 按**端口**（不是 `pkill -f 'dsh web'`）结束旧实例，避免误杀其它 profile；
 5. `systemctl --user start dsh-web`，等端口就绪；
@@ -65,8 +65,9 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3080/   # 401
 
 手工确认三件事：
 
-1. 右键面板「退出托盘」后，浏览器仍能打开/刷新界面 —— 服务不再随托盘退出。
-2. 再双击快捷方式，托盘回来且状态点是绿色。
+1. 右键面板「停止服务」→「确认停止」后，图标消失、浏览器刷新变「无法访问」——
+   这是设计语义：托盘图标就是应用开关（`stopOnExit` 可关掉这个行为）。
+2. 再双击快捷方式，托盘回来、服务重新起来、标签页自动打开。
 3. `systemctl --user restart dsh-web` 之后，左键托盘能用新 token 打开界面（旧标签会 401）。
 
 ## 回滚
@@ -86,11 +87,11 @@ pwsh -ExecutionPolicy Bypass -File tools\rollback.ps1 -Backup <dir>  # 指定备
 |---|---|---|
 | 服务归属 | 托盘（前台 wsl.exe） | systemd 用户单元 |
 | 托盘退出 | 服务停止 | 服务继续 |
-| 托盘崩溃 | 服务停止 | 服务继续 |
+| 托盘崩溃 | 服务停止 | 服务在 10–30 秒后随 VM 停止（keeper 被 Job Object 回收） |
 | dsh 崩溃 | 面板变灰，不自动拉起 | `Restart=on-failure` 3 秒后自动重启 |
 | Windows 注销 | 服务停止 | 服务停止（keeper 随会话结束） |
 | 发行版存活 | 托盘的前台 `wsl.exe`（同时持有 dsh） | keeper 常驻客户端（只占位，不持有 dsh） |
 | 停止方式 | `pkill -f 'dsh web'`（会误伤） | `systemctl --user stop`（精确） |
 | 日志 | 每次启动截断 | 追加，托盘只读尾部，靠 `[boot]` 标记判新旧 |
 | 端口 | 脚本里 6 处硬编码 | 配置文件一处 + `dsh-serve.sh` |
-| 开机自启 | 无（手动双击） | 仍为手动双击；unit 已 `enable`，发行版一启动服务即起 |
+| 开机自启 | 无（手动双击） | 仍为手动双击；unit 为 `disable`，只有托盘能启动服务 |

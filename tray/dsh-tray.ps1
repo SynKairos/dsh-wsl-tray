@@ -6,6 +6,7 @@ param(
   [switch]$NoStart,
   [string]$RenderState  = 'running',
   [string]$RenderReason = '',
+  [string]$RenderConfirm   = '',
   [int]$Probe           = 0,
   [switch]$AnchorTest,
   [string]$AnchorState  = 'running',
@@ -19,6 +20,9 @@ param(
   [switch]$ConfigTest,
   [switch]$ControllerTest,
   [switch]$KeeperTest,
+  [switch]$ReleaseTest,
+  [switch]$ExitTest,
+  [switch]$PrewarmTest,
   [switch]$BenchPanel
 )
 
@@ -38,7 +42,7 @@ Add-Type -AssemblyName System.Drawing
 # script: port, bind host, distro, account, systemd unit, log path, timeouts.
 # Nothing below may hardcode any of them.
 # Diagnostics must never block on a modal dialog: they run from scripts.
-$script:Headless = [bool]($Render -or $ConfigTest -or $ControllerTest -or $KeeperTest -or $ListWindows -or
+$script:Headless = [bool]($Render -or $ConfigTest -or $ControllerTest -or $KeeperTest -or $ReleaseTest -or $ExitTest -or $PrewarmTest -or $ListWindows -or
   $FocusTest -or $AnimTest -or $SelfTest -or $TokenTest -or $BenchPanel -or $AnchorTest -or $Probe -gt 0)
 
 $Root = if ($env:DSH_TRAY_ROOT) { $env:DSH_TRAY_ROOT } else { Join-Path $env:LOCALAPPDATA 'dsh' }
@@ -70,6 +74,13 @@ $script:Defaults = [ordered]@{
   stopTimeoutSeconds  = 25
   pollSeconds         = 3
   focusBrowser        = $true
+  # Closing the tray icon means "quit the app", not "close a window": the unit
+  # is stopped and the VM-holding keeper is killed, leaving nothing behind.
+  # Set to false only if you want the web UI to outlive the tray.
+  stopOnExit          = $true
+  exitStopTimeoutSeconds = 10
+  # Offscreen warm-up of the panel at startup. Off only for bisecting a flash.
+  prewarmPanel        = $true
 }
 
 function Read-TrayConfig {
@@ -116,6 +127,10 @@ $script:StopConfirm = [bool]$C.stopConfirm
 $script:StartTimeout = [int]$C.startTimeoutSeconds
 $script:StopTimeout  = [int]$C.stopTimeoutSeconds
 $script:PollSeconds  = [int]$C.pollSeconds
+$script:StopOnExit   = [bool]$C.stopOnExit
+$script:ExitStopTimeout = [int]$C.exitStopTimeoutSeconds
+$script:PrewarmEnabled = [bool]$C.prewarmPanel
+if ($script:ExitStopTimeout -lt 3) { $script:ExitStopTimeout = 3 }
 
 $LinuxHome = '/home/' + $script:LinuxUser
 $LogLinux  = ([string]$C.logPath).Replace('~', $LinuxHome)
@@ -159,6 +174,10 @@ $C_Amber  = '#F7AD31'
 $C_Red    = '#F25A5A'
 $C_Line   = '#0FFFFFFF'
 $C_Glyph  = '#CFD3D6'
+# Hover tint for the destructive row in the inline confirm: 16% of static-red-400,
+# so it reads as "this will hurt" without becoming a second accent colour.
+$C_RedHover = '#2AF25A5A'
+$C_AmberHover = '#2AF7AD31'
 $FontCN   = 'Microsoft YaHei UI'
 $FontIcon = 'Segoe MDL2 Assets'
 
@@ -166,14 +185,29 @@ $script:State     = 'stopped'
 $script:Reason    = ''
 $script:Panel     = $null
 $script:Run       = $true
+# Set once Exit-App starts. It gates the poll timer and the keeper re-acquire
+# path, so an exit in progress cannot be undone by a tick that fires mid-way.
+$script:Exiting   = $false
+# Inline confirmation state for the destructive row. Kept as panel state instead
+# of a dialog so the question is drawn with the same tokens as everything else.
+$script:ConfirmKind = ''
 $script:Mutex     = $null
 $script:PokeEvt   = $null
 $script:HideTimer = $null
 $script:HideArmed = $false
 $script:HideMs    = 2500
 $script:LastOpen  = [DateTime]::MinValue
+# Screen point (physical px) the panel is anchored to: the tray icon that was
+# clicked. Every later re-place - content swap, height change - must reuse it.
+# Recomputing from the live cursor makes the panel jump up-left the moment the
+# pointer is inside it, which is exactly what happened on state changes.
+$script:AnchorX   = -1
+$script:AnchorY   = -1
 $script:Prewarming = $false
-$script:WarmHide   = $null
+# PrewarmEnabled is set from config above (prewarmPanel); nothing resets it here.
+# Launch-time flyout bookkeeping, read by the one-shot timer's tick.
+$script:LaunchWhen    = ''
+$script:LaunchHideMs  = 0
 $script:AnimOk     = $true
 $script:HideGen    = 0
 $script:HideWait      = $null
@@ -186,6 +220,8 @@ $script:ForeignUntil = [DateTime]::MinValue
 # One start/stop at a time, driven by a dispatcher timer instead of a blocking
 # wait on the click handler: the UI thread must stay free to repaint the panel.
 $script:OpKind     = ''
+# Held so Exit-App can stop the poll loop before it stops the unit.
+$script:PollTimer  = $null
 $script:OpProc     = $null
 $script:OpDeadline = [DateTime]::MinValue
 $script:OpNext     = ''
@@ -198,6 +234,9 @@ $script:OpStderr   = $null
 # Linger does not help: it keeps the manager, not the VM. This client runs
 # `sleep infinity` and exists only to hold the VM while the service should live.
 $script:Keeper     = $null
+# Handle of the kill-on-close job the keeper is assigned to, so the OS reaps the
+# keeper even if this process dies without running Exit-App (crash, taskkill).
+$script:KeeperJob  = $null
 $script:KeeperOut  = $null
 $script:KeeperErr  = $null
 $script:KeeperPid  = 0
@@ -486,14 +525,21 @@ function Write-LastTokenHash([string]$Token) {
 }
 
 function New-Text {
-  param([string]$Text, [double]$Size, [string]$Color, [string]$Font = $FontCN, [string]$Weight = 'Normal')
+  param([string]$Text, [double]$Size, [string]$Color, [string]$Font = $FontCN, [string]$Weight = 'Normal', [switch]$Wrap)
   $t = New-Object System.Windows.Controls.TextBlock
   $t.Text = $Text
   $t.FontSize = $Size
   $t.FontFamily = Get-Font $Font
   $t.Foreground = Brush $Color
   if ($Weight -eq 'SemiBold') { $t.FontWeight = [System.Windows.FontWeights]::SemiBold }
-  $t.VerticalAlignment = 'Center'
+  if ($Wrap) {
+    $t.TextWrapping = 'Wrap'
+    $t.TextAlignment = 'Left'
+    $t.VerticalAlignment = 'Top'
+    $t.LineHeight = [Math]::Round($Size * 1.55, 1)
+  } else {
+    $t.VerticalAlignment = 'Center'
+  }
   return $t
 }
 
@@ -532,7 +578,9 @@ function Get-Logo {
 }
 
 function New-Row {
-  param([string]$Glyph, [string]$Label, [scriptblock]$OnClick)
+  param([string]$Glyph, [string]$Label, [scriptblock]$OnClick, [string]$Color = '', [string]$HoverBg = '')
+  if (-not $Color)   { $Color = $C_Text }
+  if (-not $HoverBg) { $HoverBg = $C_Hover }
   $b = New-Object System.Windows.Controls.Border
   $b.CornerRadius = Corner 8
   $b.Padding = Thick 22 8 12 8
@@ -542,21 +590,23 @@ function New-Row {
 
   $g = New-Object System.Windows.Controls.StackPanel
   $g.Orientation = 'Horizontal'
-  [void]$g.Children.Add((New-Glyph -Hex $Glyph))
+  $gl = New-Glyph -Hex $Glyph
+  if ($Color -ne $C_Text) { $gl.Foreground = Brush $Color }
+  [void]$g.Children.Add($gl)
   $sp = New-Object System.Windows.Controls.Border
   $sp.Width = 10
   [void]$g.Children.Add($sp)
-  [void]$g.Children.Add((New-Text -Text $Label -Size 12.5 -Color $C_Text))
+  [void]$g.Children.Add((New-Text -Text $Label -Size 12.5 -Color $Color))
   $b.Child = $g
 
-  $b.add_MouseEnter({ $this.Background = Brush $C_Hover }.GetNewClosure())
+  $b.add_MouseEnter({ $this.Background = Brush $HoverBg }.GetNewClosure())
   $b.add_MouseLeave({ $this.Background = [System.Windows.Media.Brushes]::Transparent })
   $b.add_MouseLeftButtonUp([System.Windows.Input.MouseButtonEventHandler]{ param($s, $e) & $OnClick }.GetNewClosure())
   return $b
 }
 
 function New-Panel {
-  param([string]$State, [string]$Reason)
+  param([string]$State, [string]$Reason, [string]$Confirm = '')
 
   $root = New-Object System.Windows.Controls.Border
   $root.Width = 300
@@ -663,8 +713,7 @@ function New-Panel {
   [void]$outer.Children.Add($sep)
 
   [void]$outer.Children.Add((New-Row -Glyph 'E8A7' -Label $L.menuOpen    -OnClick { Open-UI }))
-  [void]$outer.Children.Add((New-Row -Glyph 'E72C' -Label $L.menuRestart -OnClick { Restart-Server }))
-  [void]$outer.Children.Add((New-Row -Glyph 'E71A' -Label $L.menuStop    -OnClick { Confirm-Stop }))
+  [void]$outer.Children.Add((New-Row -Glyph 'E72C' -Label $L.menuRestart -OnClick { Ask-Restart }))
   if ($State -eq 'failed') {
     [void]$outer.Children.Add((New-Row -Glyph 'E7C3' -Label $L.menuLog -OnClick { Open-Log }))
   }
@@ -675,9 +724,33 @@ function New-Panel {
   $sep2.Margin = Thick 12 6 12 6
   [void]$outer.Children.Add($sep2)
 
-  $exitRow = New-Row -Glyph 'E7E8' -Label $L.menuExit -OnClick { Exit-App }
-  $exitRow.Margin = Thick 6 1 6 5
-  [void]$outer.Children.Add($exitRow)
+  # One row, one meaning: the icon is the app, so stopping the service and
+  # quitting are the same action. A separate "stop but stay resident" entry is
+  # deliberately gone - it would leave an icon whose only remaining use is to die.
+  # Both destructive rows ask their question inline: same tokens as the panel,
+  # instead of a Win32 MessageBox that can never match this surface.
+  # Red = it also ends the app; amber = it only interrupts the service.
+  if ($Confirm) {
+    $isRestart = ($Confirm -eq 'restart')
+    $hintKey = 'confirmStopHint'; $okKey = 'confirmOk'
+    $actGlyph = 'E7E8'; $actColor = $C_Red; $actHover = $C_RedHover
+    if ($isRestart) {
+      $hintKey = 'confirmRestartHint'; $okKey = 'confirmRestartOk'
+      $actGlyph = 'E72C'; $actColor = $C_Amber; $actHover = $C_AmberHover
+    }
+    $hb = New-Object System.Windows.Controls.Border
+    $hb.Margin = Thick 45 2 20 4
+    $hb.Child = (New-Text -Text $L.$hintKey -Size 10.5 -Color $C_Sub -Wrap)
+    [void]$outer.Children.Add($hb)
+    $okRow = New-Row -Glyph $actGlyph -Label $L.$okKey -OnClick { Confirm-Action } -Color $actColor -HoverBg $actHover
+    $okRow.Margin = Thick 6 1 6 1
+    [void]$outer.Children.Add($okRow)
+    [void]$outer.Children.Add((New-Row -Glyph 'E711' -Label $L.confirmCancel -OnClick { Cancel-Confirm }))
+  } else {
+    $exitRow = New-Row -Glyph 'E7E8' -Label $L.menuStop -OnClick { Ask-Stop }
+    $exitRow.Margin = Thick 6 1 6 5
+    [void]$outer.Children.Add($exitRow)
+  }
 
   $root.Child = $outer
   return $root
@@ -769,6 +842,99 @@ function Test-KeeperAlive {
   return $false
 }
 
+# --- job object: OS-level guarantee for the keeper --------------------------
+# Exit-App kills the keeper on the normal path. That is not enough: a crash, a
+# taskkill or a logoff skips Exit-App entirely and leaves a wsl.exe that holds
+# the VM forever. Putting the keeper in a kill-on-close job makes the OS reap it
+# the moment this process disappears, whatever the reason.
+# Degrades silently to the exit-time kill if the type cannot be compiled.
+function Initialize-KeeperJob {
+  if ($null -ne $script:KeeperJob) { return ($script:KeeperJob -ne [IntPtr]::Zero) }
+  $script:KeeperJob = [IntPtr]::Zero
+  try {
+    if (-not ('DshJob' -as [type])) {
+      $code = @'
+using System;
+using System.Runtime.InteropServices;
+public class DshJob {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct IO_COUNTERS {
+    public ulong ReadOperationCount;
+    public ulong WriteOperationCount;
+    public ulong OtherOperationCount;
+    public ulong ReadTransferCount;
+    public ulong WriteTransferCount;
+    public ulong OtherTransferCount;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+    public long PerProcessUserTimeLimit;
+    public long PerJobUserTimeLimit;
+    public uint LimitFlags;
+    public UIntPtr MinimumWorkingSetSize;
+    public UIntPtr MaximumWorkingSetSize;
+    public uint ActiveProcessLimit;
+    public UIntPtr Affinity;
+    public uint PriorityClass;
+    public uint SchedulingClass;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+    public IO_COUNTERS IoInfo;
+    public UIntPtr ProcessMemoryLimit;
+    public UIntPtr JobMemoryLimit;
+    public UIntPtr PeakProcessMemoryUsed;
+    public UIntPtr PeakJobMemoryUsed;
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern IntPtr CreateJobObject(IntPtr sa, string name);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint len);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr proc);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool CloseHandle(IntPtr h);
+  public static IntPtr CreateKillOnClose() {
+    IntPtr job = CreateJobObject(IntPtr.Zero, null);
+    if (job == IntPtr.Zero) { return IntPtr.Zero; }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+    info.BasicLimitInformation.LimitFlags = 0x2000;
+    int len = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+    if (!SetInformationJobObject(job, 9, ref info, (uint)len)) { CloseHandle(job); return IntPtr.Zero; }
+    return job;
+  }
+}
+'@
+      Add-Type -TypeDefinition $code -ErrorAction Stop
+    }
+    $script:KeeperJob = [DshJob]::CreateKillOnClose()
+    if ($script:KeeperJob -eq [IntPtr]::Zero) {
+      Write-TrayLog 'job: create failed, falling back to exit-time kill' 'warn'
+    } else {
+      Write-TrayLog 'job: kill-on-close armed'
+    }
+  } catch {
+    Write-TrayLog ('job: unavailable: ' + $_.Exception.Message) 'warn'
+    $script:KeeperJob = [IntPtr]::Zero
+  }
+  return ($script:KeeperJob -ne [IntPtr]::Zero)
+}
+
+function Add-KeeperToJob([System.Diagnostics.Process]$P) {
+  if ($null -eq $P) { return $false }
+  if ($null -eq $script:KeeperJob -or $script:KeeperJob -eq [IntPtr]::Zero) { return $false }
+  try {
+    $h = $P.Handle
+    $ok = [DshJob]::AssignProcessToJobObject($script:KeeperJob, $h)
+    Write-TrayLog ('job: assign pid=' + $P.Id + ' ok=' + $ok)
+    return $ok
+  } catch {
+    Write-TrayLog ('job: assign failed: ' + $_.Exception.Message) 'warn'
+    return $false
+  }
+}
+
 function Ensure-Keeper {
   if ($script:Keeper) {
     try { if (-not $script:Keeper.HasExited) { return $true } } catch { }
@@ -781,8 +947,10 @@ function Ensure-Keeper {
     return $true
   }
   try {
+    [void](Initialize-KeeperJob)
     $script:Keeper = New-KeeperProcess ($WslBase + '/bin/sleep infinity')
     $script:KeeperPid = $script:Keeper.Id
+    [void](Add-KeeperToJob $script:Keeper)
     Write-TrayLog ('keeper: spawned pid=' + $script:KeeperPid)
     return $true
   } catch {
@@ -795,10 +963,15 @@ function Ensure-Keeper {
 
 # Short synchronous call for diagnostics (`is-active`, `status`). Never used on
 # the 3 s poll path, because every wsl.exe spawn costs a process hand-off.
-function Invoke-Systemctl([string]$Verb) {  $p = $null
+# The wait is capped: a cold VM needs ten-plus seconds just to boot, so callers
+# that must survive a cold start pass a larger timeout (-ExitTest does).
+function Invoke-Systemctl([string]$Verb, [string]$Extra = '', [int]$TimeoutMs = 8000) {  $p = $null
   try {
-    $p = New-WslProcess ($WslBase + 'systemctl --user --no-pager ' + $Verb + ' ' + $script:Unit)
-    if (-not $p.WaitForExit(8000)) { try { $p.Kill() } catch { }; return @{ Code = -1; Text = 'timeout after 8000ms' } }
+    $cmd = 'systemctl --user --no-pager ' + $Verb
+    if ($Extra) { $cmd += ' ' + $Extra }
+    $cmd += ' ' + $script:Unit
+    $p = New-WslProcess ($WslBase + $cmd)
+    if (-not $p.WaitForExit($TimeoutMs)) { try { $p.Kill() } catch { }; return @{ Code = -1; Text = ('timeout after ' + $TimeoutMs + 'ms') } }
     return @{ Code = $p.ExitCode; Text = (Get-WslOutput $p) }
   } catch {
     return @{ Code = -2; Text = $_.Exception.Message }
@@ -839,6 +1012,9 @@ function Complete-Start([bool]$Ok, [string]$Why = '') {
   Write-TrayLog ('start -> ok=' + $Ok + ' reason=' + $script:Reason)
   Update-PanelContent
   if ($Ok -and $open) { Open-Browser }
+  # The launch-time flyout showed "starting": on failure it must not sit there
+  # forever, so give it the same 8 s the other failure hints get.
+  if (-not $Ok -and $open) { Start-HideTimer 8000 }
 }
 
 function Complete-Stop([bool]$Ok) {
@@ -870,7 +1046,11 @@ function Update-Op {
       # is the least reliable link in the chain and stays off the polling path.
       $code = Test-DshHttp -TimeoutMs 700
       if ($code -eq 401 -or $code -eq 303) { Complete-Start $true; return }
-      if ($code -ne -2) { Complete-Start $false 'port'; return }
+      # Any other answer is transitional, not a port conflict: the listener binds
+      # before the webServer plugin is ready and answers 404/503 in that window
+      # (observed 2026-11-25 17:02:28, which aborted a healthy start). A real
+      # conflict was already ruled out by Begin-Start before the unit was asked
+      # to start, so wait out the deadline instead of guessing here.
     }
     $exited = $false
     if ($script:OpProc) { try { $exited = $script:OpProc.HasExited } catch { $exited = $true } }
@@ -970,36 +1150,56 @@ function Begin-Stop {
   Update-PanelContent
 }
 
-function Stop-Server { Begin-Stop }
+# There is no "stop and stay resident" entry point any more: stopping the unit
+# without leaving would strand an icon that can only be used to quit. Begin-Stop
+# remains because -SelfTest and the restart path need a stop that does not exit.
 
-# A modal question, owned by the panel when it exists so it cannot open behind
-# another window. Falls back to the active desktop otherwise.
-function Ask-Confirm([string]$Message, [string]$Fallback) {
-  $msg = $Message
-  if (-not $msg) { $msg = $Fallback }
-  $title = [string]$L.appName
-  $answer = $null
-  if ($script:Panel) {
-    $answer = [System.Windows.MessageBox]::Show($script:Panel, $msg, $title, 'YesNo', 'Warning')
-  } else {
-    $answer = [System.Windows.MessageBox]::Show($msg, $title, 'YesNo', 'Warning')
-  }
-  return ($answer -eq 'Yes')
+# Both destructive rows ask their question inline, in the panel, with the
+# panel's own tokens: a Win32 MessageBox cannot be themed and looked foreign on
+# this surface. One state variable, two kinds.
+function Keep-PanelOpen {
+  # A swap during a fade-out used to hide the panel right after it had been
+  # repainted, which read as "the panel closed and a new one popped up".
+  if ($script:HideWait) { $script:HideWait.Stop() }
+  $script:HideGen++
+  if ($script:Panel) { $script:Panel.Opacity = 1.0 }
 }
 
-# Stopping kills in-flight agent turns, so a single stray click must not do it.
-function Confirm-Stop {
-  if (-not $script:StopConfirm) { Stop-Server; return }
-  Hide-Panel
-  if (Ask-Confirm ([string]$L.confirmStop) 'Stop the service? Running agent turns will be aborted.') { Stop-Server }
+function Start-Confirm([string]$Kind) {
+  $script:ConfirmKind = $Kind
+  # The pointer may leave the flyout on the way to the answer: hold it open.
+  if ($script:HideTimer) { $script:HideTimer.Stop() }
+  Keep-PanelOpen
+  Update-PanelContent
 }
 
-function Restart-Server {
+function Ask-Stop {
+  if (-not $script:StopConfirm) { Exit-App; return }
+  Start-Confirm 'stop'
+}
+
+function Ask-Restart {
+  if (-not $script:StopConfirm) { Do-Restart; return }
+  Start-Confirm 'restart'
+}
+
+function Cancel-Confirm {
+  $script:ConfirmKind = ''
+  Keep-PanelOpen
+  Update-PanelContent
+}
+
+function Confirm-Action {
+  $kind = $script:ConfirmKind
+  $script:ConfirmKind = ''
+  if ($kind -eq 'restart') { Do-Restart; return }
+  Exit-App
+}
+
+# Restart kills in-flight agent turns, so it asks first - but it never exits, and
+# the question was already answered by the time this runs.
+function Do-Restart {
   if ($script:OpKind -eq 'stop') { return }
-  if ($script:StopConfirm) {
-    Hide-Panel
-    if (-not (Ask-Confirm ([string]$L.confirmRestart) 'Restart the service? Running agent turns will be interrupted.')) { return }
-  }
   $script:OpNext = 'start'
   Begin-Stop
 }
@@ -1021,9 +1221,13 @@ function Open-Browser {
 }
 
 function Open-UI {
+  param([switch]$FromTray)
+  # Never build UI once the app is tearing down: the startup open timer can land
+  # milliseconds after a quit and would otherwise resurrect a panel window.
+  if ($script:Exiting) { return }
   Hide-Panel
   # A start in flight will open the browser itself when it completes.
-  if ($script:OpKind -eq 'start') { $script:OpOpen = $true; Show-Panel; return }
+  if ($script:OpKind -eq 'start') { $script:OpOpen = $true; Show-Panel -Anchor:$FromTray; return }
   if ($script:OpKind -eq 'stop') { return }
 
   $kind = Get-PortState
@@ -1031,7 +1235,7 @@ function Open-UI {
     $script:State = 'failed'
     $script:Reason = 'port'
     $script:PortKind = 'foreign'
-    Show-Panel
+    Show-Panel -Anchor:$FromTray
     Start-HideTimer 8000
     return
   }
@@ -1049,7 +1253,7 @@ function Open-UI {
     Write-TrayLog 'no token found in the log tail' 'warn'
     $script:State = 'failed'
     $script:Reason = 'token'
-    Show-Panel
+    Show-Panel -Anchor:$FromTray
     Start-HideTimer 8000
     return
   }
@@ -1064,7 +1268,9 @@ function Open-UI {
   if ($reuse) {
     $w = Find-DshWindow
     if ($w -ne [IntPtr]::Zero) {
-      if (Focus-Window $w) { return }
+      # Hide first: the launch-time flyout is on screen and would otherwise stay
+      # there after the tab was focused.
+      if (Focus-Window $w) { Hide-Panel; return }
     }
   }
   Start-Process ($script:BaseUrl + '?token=' + $t)
@@ -1088,6 +1294,8 @@ function Complete-Hide {
 
 function Hide-Panel {
   $script:HideArmed = $false
+  # A closed panel must never reopen mid-question: the confirm state dies with it.
+  $script:ConfirmKind = ''
   if (-not $script:Panel) { return }
   if (-not $script:Panel.IsVisible) { return }
   if (-not $script:AnimOk) { $script:Panel.Hide(); return }
@@ -1140,8 +1348,8 @@ function Get-DipScale {
 }
 
 function Get-PanelHeight {
-  param([string]$State)
-  $c = New-Panel -State $State -Reason ''
+  param([string]$State, [string]$Confirm = '')
+  $c = New-Panel -State $State -Reason '' -Confirm $Confirm
   $c.Measure((New-Object System.Windows.Size(300, [double]::PositiveInfinity)))
   $h = [Math]::Ceiling($c.DesiredSize.Height)
   if ($h -lt 100) { $h = 270 }
@@ -1177,10 +1385,10 @@ function Mark {
 # One cached visual tree per (state, reason) keeps a click from rebuilding ~40
 # text elements, re-decoding the icon and re-parsing hex colors.
 function Get-PanelEntry {
-  param([string]$State, [string]$Reason)
-  $Key = $State + '|' + $Reason
+  param([string]$State, [string]$Reason, [string]$Confirm = '')
+  $Key = $State + '|' + $Reason + '|' + $Confirm
   if ($script:PanelCache.ContainsKey($Key)) { return $script:PanelCache[$Key] }
-  $c = New-Panel -State $State -Reason $Reason
+  $c = New-Panel -State $State -Reason $Reason -Confirm $Confirm
   $c.Measure((New-Object System.Windows.Size(300, [double]::PositiveInfinity)))
   $h = [Math]::Ceiling($c.DesiredSize.Height)
   if ($h -lt 100) { $h = 270 }
@@ -1189,7 +1397,7 @@ function Get-PanelEntry {
   return $entry
 }
 
-function Get-PanelKey { return ($script:State + '|' + $script:Reason) }
+function Get-PanelKey { return ($script:State + '|' + $script:Reason + '|' + $script:ConfirmKind) }
 
 # Swap the cached tree in place while the panel is open, so a state change during
 # a start/stop is visible without closing and reopening the flyout.
@@ -1200,9 +1408,12 @@ function Update-PanelContent {
   $k = Get-PanelKey
   if ($k -eq $script:ShownKey) { return }
   $script:ShownKey = $k
-  $entry = Get-PanelEntry -State $script:State -Reason $script:Reason
+  $entry = Get-PanelEntry -State $script:State -Reason $script:Reason -Confirm $script:ConfirmKind
   $script:Panel.Content = $entry.Content
-  $pl = Get-PanelPlacement -H $entry.H
+  # Place from the stored anchor, never from the cursor: the pointer is inside
+  # the panel at this point, and using it as the anchor would drag the panel
+  # up-left on every content swap (observed 19:00).
+  $pl = Get-PanelPlacement -H $entry.H -Cx $script:AnchorX -Cy $script:AnchorY
   $script:Panel.Left = $pl.Left
   $script:Panel.Top = $pl.Top
 }
@@ -1223,49 +1434,47 @@ function Ensure-PanelWindow {
   $script:Panel = $w
 }
 
-# Pay the lazy WPF cost (window handle, theme resources, DirectWrite font cache)
-# once at startup instead of on the first right click. The window is composed at
-# the real anchor position with near-zero opacity, so the first visible frame is
-# already prepared instead of being built on the click.
+# Pay the lazy WPF cost (visual tree, DirectWrite font cache, rasterisation) once
+# at startup instead of on the first right click.
+# The old version warmed this by SHOWING the window at Opacity=0.01 for 180 ms.
+# That flashes: a layered window can be composited at full alpha for the first
+# frame, before its layer attributes land, so a faint ghost of the panel appeared
+# and vanished on every launch. Nothing is shown now - the same tree is measured,
+# arranged and rasterised into an offscreen bitmap, which exercises the pipeline
+# without ever putting pixels on screen.
 function Prewarm-Panel {
   try {
-    Ensure-PanelWindow
-    $entry = Get-PanelEntry -State $script:State -Reason $script:Reason
-    $script:ShownKey = Get-PanelKey
-    $script:Panel.Content = $entry.Content
-    $pl = Get-PanelPlacement -H $entry.H
-    $script:Panel.Left    = $pl.Left
-    $script:Panel.Top     = $pl.Top
-    $script:Panel.ShowActivated = $false
-    $script:Panel.Opacity = 0.01
-    $script:Panel.Show()
-    # Showing and hiding inside one dispatcher tick produces no frame at all, so
-    # the expensive first composition would still land on the first real click.
-    # Keep it alive for a couple of frames before hiding.
-    $script:Prewarming = $true
-    if (-not $script:WarmHide) {
-      $script:WarmHide = New-Object System.Windows.Threading.DispatcherTimer
-      $script:WarmHide.Interval = [TimeSpan]::FromMilliseconds(180)
-      $script:WarmHide.add_Tick({
-        $script:WarmHide.Stop()
-        if ($script:Prewarming) {
-          $script:Prewarming = $false
-          Hide-Panel
-          $script:Panel.Opacity = 1.0
-        }
-      })
-    }
-    $script:WarmHide.Start()
+    if (-not $script:PrewarmEnabled) { return $false }
+    # Nothing to warm while the real flyout is on screen, and measuring a tree
+    # that is already arranged inside the window would disturb that layout.
+    if ($script:Panel -and $script:Panel.IsVisible) { return $false }
+    $entry = Get-PanelEntry -State $script:State -Reason $script:Reason -Confirm $script:ConfirmKind
+    $c = $entry.Content
+    $c.Measure((New-Object System.Windows.Size(300, [double]::Infinity)))
+    $c.Arrange((New-Object System.Windows.Rect(0, 0, 300, $entry.H)))
+    $c.UpdateLayout()
+    $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(300, [int]$entry.H, 96, 96, ([System.Windows.Media.PixelFormats]::Pbgra32))
+    $rtb.Render($c)
     return $true
   } catch {
-    try { $script:Panel.Opacity = 1.0 } catch { }
     return $false
   }
 }
 
 function Show-Panel {
+  param([switch]$Anchor)
   $swP = $null
   if ($script:Phase) { $swP = [System.Diagnostics.Stopwatch]::StartNew() }
+  # Capture the anchor only when the caller says the click that opened the panel
+  # is here. Every other re-show reuses the stored one: by then the pointer is
+  # inside the panel, and taking it for an anchor drags the panel up-left.
+  if ($Anchor) {
+    try {
+      $cp = [System.Windows.Forms.Cursor]::Position
+      $script:AnchorX = $cp.X
+      $script:AnchorY = $cp.Y
+    } catch { }
+  }
   $script:Prewarming = $false
   $script:HideGen++
   if ($script:Panel) { $script:Panel.Opacity = 1.0 }
@@ -1280,11 +1489,11 @@ function Show-Panel {
   }
   Mark 'probe' $swP
   Ensure-PanelWindow
-  $entry = Get-PanelEntry -State $script:State -Reason $script:Reason
+  $entry = Get-PanelEntry -State $script:State -Reason $script:Reason -Confirm $script:ConfirmKind
   $script:ShownKey = Get-PanelKey
   Mark 'entry' $swP
   $script:Panel.Content = $entry.Content
-  $pl = Get-PanelPlacement -H $entry.H
+  $pl = Get-PanelPlacement -H $entry.H -Cx $script:AnchorX -Cy $script:AnchorY
   Mark 'place' $swP
   $script:Panel.Left = $pl.Left
   $script:Panel.Top  = $pl.Top
@@ -1305,29 +1514,136 @@ function Show-Panel {
   Mark 'activate' $swP
 }
 
-# Quitting the tray never stops the service: systemd owns it. Killing the
-# in-flight wsl.exe client is enough to release this process.
-function Exit-App {
-  Write-TrayLog 'exit requested'
-  if ($script:OpProc) { try { if (-not $script:OpProc.HasExited) { $script:OpProc.Kill() } } catch { } }
-  # The unit is meant to outlive the tray, and it can only do that while some
-  # client holds the VM. If nothing is serving there is nothing to hold, so the
-  # keeper goes away and the distro is free to shut down.
-  if ((-not (Test-Up)) -and (-not $script:OpKind)) {
-    foreach ($kp in @(Get-KeeperPids)) {
-      try { Stop-Process -Id $kp -Force -ErrorAction Stop; Write-TrayLog ('keeper: released pid=' + $kp) } catch { }
+# The launch-time flyout. Delayed one beat so the window is not composed before
+# the tray icon is registered - it would look orphaned in the task switcher.
+# The tick reads script-scope state, not the parameters: an add_Tick scriptblock
+# does not capture the enclosing function's variables (see Complete-Hide).
+function Start-LaunchPanel([string]$When, [int]$HideMs = 0) {
+  $script:LaunchWhen = $When
+  $script:LaunchHideMs = $HideMs
+  $script:StartShowTimer = New-Object System.Windows.Threading.DispatcherTimer
+  $script:StartShowTimer.Interval = [TimeSpan]::FromMilliseconds(450)
+  $script:StartShowTimer.add_Tick({
+    $script:StartShowTimer.Stop()
+    if ($script:Exiting) { return }
+    # A warm start can finish inside the delay; showing then would leave a
+    # "running" panel on screen that nothing closes.
+    if ($script:LaunchWhen -eq 'starting' -and $script:OpKind -ne 'start') { return }
+    Show-Panel -Anchor
+    if ($script:LaunchHideMs -gt 0) { Start-HideTimer $script:LaunchHideMs }
+  })
+  $script:StartShowTimer.Start()
+}
+
+# --- exit path --------------------------------------------------------------
+# Contract: the tray icon IS the app. Once it disappears nothing of dsh may keep
+# running - not the unit, not the keeper, not the VM.
+# Two things make that harder than it looks:
+#   1) the unit belongs to systemd, so it outlives this process by design;
+#   2) the poll tick re-acquires the keeper whenever the port answers, so a
+#      keeper killed before the unit is stopped comes back within 3 seconds.
+# Hence the order: flag -> stop polling -> stop unit -> wait for the port ->
+# kill the keeper, and the keep-alive must be released whatever happens.
+# Extracted so the release path can also be exercised headless (-ReleaseTest).
+function Release-Keeper([switch]$Force) {
+  if (-not $Force) {
+    if ((Test-Up) -or $script:OpKind) {
+      Write-TrayLog 'keeper: left running (service still up or op in flight)'
+      return $false
     }
-    if ($script:Keeper) { try { if (-not $script:Keeper.HasExited) { $script:Keeper.Kill() } } catch { } }
-    $script:Keeper = $null
-    $script:KeeperPid = 0
-  } else {
-    Write-TrayLog 'keeper: left running (service still up or op in flight)'
   }
-  if ($script:Tray) { $script:Tray.Visible = $false; $script:Tray.Dispose() }
-  if ($script:Panel) { $script:Panel.Close() }
-  if ($script:Mutex) { try { $script:Mutex.ReleaseMutex() } catch { } }
-  $script:Run = $false
-  [System.Windows.Application]::Current.Shutdown()
+  $killed = @()
+  foreach ($kp in @(Get-KeeperPids)) {
+    try { Stop-Process -Id $kp -Force -ErrorAction Stop; $killed += $kp; Write-TrayLog ('keeper: released pid=' + $kp) } catch { }
+  }
+  if ($script:Keeper) { try { if (-not $script:Keeper.HasExited) { $script:Keeper.Kill() } } catch { } }
+  $script:Keeper = $null
+  $script:KeeperPid = 0
+  Write-TrayLog ('keeper: released count=' + $killed.Count)
+  return $true
+}
+
+function Release-KeeperIfIdle { return (Release-Keeper) }
+
+# Synchronous stop used only on the exit path. The icon is already hidden, so
+# blocking the dispatcher is acceptable here and much simpler than driving the
+# async state machine while tearing it down.
+function Stop-ServiceNow {
+  param([int]$TimeoutSec = 10)
+  Write-TrayLog ('exit: systemctl --user stop ' + $script:Unit)
+  $r = Invoke-Systemctl 'stop'
+  Write-TrayLog ('exit: stop rc=' + $r.Code + ' text=' + $r.Text)
+  $deadline = [DateTime]::Now.AddSeconds($TimeoutSec)
+  while ([DateTime]::Now -lt $deadline) {
+    if (-not (Test-Up -TimeoutMs 250)) { return $true }
+    Start-Sleep -Milliseconds 200
+  }
+  Write-TrayLog 'exit: port still bound after stop, SIGKILL to the unit cgroup' 'warn'
+  [void](Invoke-Systemctl 'kill' '-s SIGKILL')
+  $deadline = [DateTime]::Now.AddSeconds(3)
+  while ([DateTime]::Now -lt $deadline) {
+    if (-not (Test-Up -TimeoutMs 250)) { return $true }
+    Start-Sleep -Milliseconds 200
+  }
+  Write-TrayLog 'exit: port still bound; the keeper release takes the VM down anyway' 'warn'
+  return $false
+}
+
+# Start-up counterpart. A keeper cannot belong to a live tray while we hold the
+# single-instance mutex. If nothing is serving it only pins the VM, so reap it;
+# if the port answers, the keeper is what holds the running unit - leave it and
+# let the force-release at exit reap it.
+function Clear-OrphanKeepers {
+  $pids = @(Get-KeeperPids)
+  if ($pids.Count -eq 0) { return 0 }
+  if (Test-Up) {
+    Write-TrayLog ('orphan check: ' + $pids.Count + ' keeper(s) kept while the unit is up: ' + ($pids -join ','))
+    return 0
+  }
+  $n = 0
+  foreach ($kp in $pids) {
+    try { Stop-Process -Id $kp -Force -ErrorAction Stop; $n++; Write-TrayLog ('orphan keeper killed pid=' + $kp) 'warn' } catch { }
+  }
+  return $n
+}
+
+function Exit-App {
+  if ($script:Exiting) { return }
+  $script:Exiting = $true
+  Write-TrayLog 'exit requested'
+  try {
+    # Stop the clocks first: a tick landing mid-exit would re-acquire the keeper
+    # the moment the port answered, undoing the release below.
+    foreach ($t in @($script:PollTimer, $script:OpTimer, $script:WarmTimer, $script:HideTimer, $script:StartOpenTimer, $script:StartShowTimer)) {
+      try { if ($t) { $t.Stop() } } catch { }
+    }
+    if ($script:OpProc) { try { if (-not $script:OpProc.HasExited) { $script:OpProc.Kill() } } catch { } }
+    $script:OpProc = $null
+    $script:OpKind = ''
+    # Hide icon and panel first: from the user's point of view the app is closed
+    # the moment they click, even though the teardown below takes a second or two.
+    if ($script:Tray) { try { $script:Tray.Visible = $false } catch { } }
+    if ($script:Panel) { try { $script:Panel.Hide() } catch { } }
+    if ($script:StopOnExit) {
+      $stopped = Stop-ServiceNow $script:ExitStopTimeout
+      Write-TrayLog ('exit: service stopped=' + $stopped)
+    } else {
+      Write-TrayLog 'exit: stopOnExit=false, unit left running'
+    }
+  } catch {
+    Write-TrayLog ('exit: teardown error: ' + $_.Exception.Message) 'error'
+  } finally {
+    # Force, not IfIdle: after a stop request the keeper must go even if a
+    # leftover listener still answers - the VM teardown finishes the job.
+    try { [void](Release-Keeper -Force) } catch { Write-TrayLog ('exit: keeper release failed: ' + $_.Exception.Message) 'error' }
+    try { if ($script:Mutex) { $script:Mutex.ReleaseMutex() } } catch { }
+    $script:Run = $false
+    # Shutdown BEFORE disposing the UI objects: the old order disposed the icon
+    # first, so an exception in Close() left an invisible, unreachable process.
+    try { [System.Windows.Application]::Current.Shutdown() } catch { }
+    try { if ($script:Panel) { $script:Panel.Close() } } catch { }
+    try { if ($script:Tray) { $script:Tray.Dispose() } } catch { }
+  }
 }
 
 if ($ListWindows) {
@@ -1418,6 +1734,40 @@ if ($Probe -gt 0) {
   exit 0
 }
 
+# The destructive probes below run BEFORE the single-instance mutex is taken, so
+# they can coexist with a live tray and silently tear down its unit and keeper.
+# (Observed 2026-11-25 17:38: -ExitTest adopted and killed a running tray's
+# keeper, leaving that tray keeper-less.) Refuse to run when one is up.
+function Test-TrayInstanceRunning {
+  foreach ($sc in @('Global', 'Local')) {
+    $name = $sc + '\dsh-tray-' + $env:USERNAME
+    $m = $null
+    try { $m = New-Object System.Threading.Mutex -ArgumentList @($false, $name) } catch { continue }
+    try {
+      # Hold it for zero time: acquiring a free mutex proves nobody owns it.
+      $owned = $m.WaitOne(0, $false)
+      if ($owned) { try { $m.ReleaseMutex() } catch { } }
+      else { return $true }
+    } catch [System.Threading.AbandonedMutexException] {
+      # The previous owner died, so no live instance holds it.
+    } catch {
+    } finally {
+      try { $m.Dispose() } catch { }
+    }
+  }
+  return $false
+}
+
+function Assert-NoTrayInstance {
+  if (Test-TrayInstanceRunning) {
+    # Console, not Write-Output: mixing the two makes the caller receive an
+    # array, which is truthy, and the guard silently passes.
+    [Console]::WriteLine('abort: a tray instance is running; quit it first (right click -> stop service)')
+    return $false
+  }
+  return $true
+}
+
 # Keeper probe: spawn the VM-holding client and exit without killing it, so an
 # outside observer can tell whether the distro survives once the spawning process
 # is gone. Leaves the keeper behind on purpose.
@@ -1435,14 +1785,83 @@ if ($KeeperTest) {
   exit 0
 }
 
+# Release path probe: the same function Exit-App calls, run headless. Only does
+# anything when the service is down; that is exactly the case worth testing.
+if ($ReleaseTest) {
+  if (-not (Assert-NoTrayInstance)) { exit 2 }
+  Write-Output ('port_up=' + (Test-Up))
+  Write-Output ('keepers_before=' + (@(Get-KeeperPids) -join ','))
+  $r = Release-KeeperIfIdle
+  Start-Sleep -Milliseconds 800
+  Write-Output ('released=' + $r)
+  Write-Output ('keepers_after=' + (@(Get-KeeperPids) -join ','))
+  Write-Output ('port_after=' + (Test-Up))
+  exit 0
+}
+
+# Full exit-path probe: bring the unit up, then run the very Exit-App the menu
+# calls and report what is left behind. Assertions stay Windows-side on purpose:
+# asking WSL about the distro would boot the VM and defeat the measurement.
+if ($ExitTest) {
+  if (-not (Assert-NoTrayInstance)) { exit 2 }
+  $log = Join-Path $Root 'exittest.txt'
+  $lines = New-Object System.Collections.ArrayList
+  function Note([string]$s) { [void]$lines.Add($s); Write-Output $s }
+  try {
+    Note ('stopOnExit=' + $script:StopOnExit + ' exitStopTimeout=' + $script:ExitStopTimeout)
+    [void](Ensure-Keeper)
+    # A cold VM needs ten-plus seconds just to boot, so the start gets a wide
+    # deadline and one retry: a timeout here is a measurement artefact, not a
+    # defect in the exit path.
+    $r = Invoke-Systemctl 'start' '' 60000
+    if ($r.Code -ne 0) {
+      Note ('start retry after rc=' + $r.Code + ' text=' + $r.Text)
+      $r = Invoke-Systemctl 'start' '' 60000
+    }
+    Note ('start rc=' + $r.Code + ' text=' + $r.Text)
+    $deadline = [DateTime]::Now.AddSeconds(60)
+    $up = $false
+    while ([DateTime]::Now -lt $deadline) {
+      if ((Test-DshHttp -TimeoutMs 1000) -eq 401) { $up = $true; break }
+      Start-Sleep -Milliseconds 400
+    }
+    Note ('service_up=' + $up)
+    Note ('keepers_before=' + (@(Get-KeeperPids) -join ','))
+    $t0 = [DateTime]::Now
+    Exit-App
+    Note ('exit_ms=' + [int]([DateTime]::Now - $t0).TotalMilliseconds)
+    Start-Sleep -Seconds 4
+    Note ('port_after=' + (Get-PortState))
+    Note ('keepers_after=' + (@(Get-KeeperPids) -join ','))
+  } catch {
+    Note ('error=' + $_.Exception.Message)
+  } finally {
+    try { [System.IO.File]::WriteAllLines($log, [string[]]$lines) } catch { }
+  }
+  exit 0
+}
+
 # Configuration resolution: prints what every other switch would use, without
 # touching the service. Run it right after editing dsh-tray.config.json.
+# Warm-up probe: the panel must not exist as a window at startup. A visible
+# window here is exactly the launch flash users reported.
+if ($PrewarmTest) {
+  $t0 = [DateTime]::Now
+  $ok = Prewarm-Panel
+  $ms = [int]([DateTime]::Now - $t0).TotalMilliseconds
+  Write-Output ('prewarm_ok=' + $ok)
+  Write-Output ('panel_created=' + ($null -ne $script:Panel))
+  Write-Output ('ms=' + $ms)
+  exit 0
+}
+
 if ($ConfigTest) {
   Write-Output ('config   = ' + $ConfigFile)
   Write-Output ('distro   = ' + $script:Distro)
   Write-Output ('user     = ' + $script:LinuxUser)
   Write-Output ('endpoint = ' + $script:BindHost + ':' + $script:Port)
   Write-Output ('unit     = ' + $script:Unit)
+  Write-Output ('stopOnExit=' + $script:StopOnExit + ' exitStopTimeout=' + $script:ExitStopTimeout + ' prewarm=' + $script:PrewarmEnabled)
   Write-Output ('logunc   = ' + $LogUnc)
   Write-Output ('logexists= ' + (Test-Path $LogUnc))
   foreach ($f in @($ConfigFile, $IcoPath, $LabelFile)) {
@@ -1484,6 +1903,7 @@ if ($TokenTest) {
 # starved. A blocking wait would show up as a multi-second gap; the async state
 # machine must keep the heartbeat under a few hundred ms.
 if ($SelfTest) {
+  if (-not (Assert-NoTrayInstance)) { exit 2 }
   $app = New-Object System.Windows.Application
   $app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
   $script:SelfLog    = New-Object System.Collections.ArrayList
@@ -1581,7 +2001,7 @@ if ($SelfTest) {
 
 if ($Render) {
   if ($RenderReason) { $script:Reason = $RenderReason }
-  $p = New-Panel -State $RenderState -Reason $script:Reason
+  $p = New-Panel -State $RenderState -Reason $script:Reason -Confirm $RenderConfirm
   $p.Measure((New-Object System.Windows.Size(300, [double]::PositiveInfinity)))
   $h = [Math]::Ceiling($p.DesiredSize.Height)
   $p.Arrange((New-Object System.Windows.Rect(0, 0, 300, $h)))
@@ -1591,7 +2011,7 @@ if ($Render) {
   $rtb.Render($p)
   $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
   $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($rtb))
-  $out = Join-Path $Root ('panel-' + $RenderState + '.png')
+  $out = Join-Path $Root ('panel-' + $RenderState + $(if ($RenderConfirm) { '-' + $RenderConfirm } else { '' }) + '.png')
   $fs = [System.IO.File]::Create($out)
   $enc.Save($fs); $fs.Close()
   Write-Output ('rendered state=' + $RenderState + ' reason=' + $script:Reason + ' h=' + $h + ' ap=' + [System.Threading.Thread]::CurrentThread.GetApartmentState())
@@ -1626,13 +2046,41 @@ try {
   $script:PokeEvt = New-Object System.Threading.EventWaitHandle -ArgumentList @($false, [System.Threading.EventResetMode]::AutoReset, "$scope\dsh-show-$env:USERNAME")
 } catch { $script:PokeEvt = $null }
 
+# A keeper that exists while we hold the single-instance mutex cannot belong to
+# a live tray. With nothing serving it only pins the VM, so reap it here; the
+# fresh keeper is spawned by Begin-Start / Ensure-Keeper right after.
+[void](Clear-OrphanKeepers)
+
 if ($NoStart) {
   Write-TrayLog 'NoStart: not touching the service'
   # Still hold the VM: an already-running unit dies with the distro otherwise.
   [void](Ensure-Keeper)
   if (Test-Up) { $script:State = 'running'; $script:PortKind = 'dsh' }
 } else {
+  # Launching the shortcut means "show me dsh": Complete-Start opens the browser
+  # when OpOpen is set. If the unit was already answering, nothing will call
+  # Complete-Start, so open from a one-shot timer instead of right here - the
+  # tray icon and the dispatcher loop are not up yet at this point.
+  $script:OpOpen = $true
   [void](Begin-Start)
+  if ($script:State -eq 'running') {
+    $script:StartOpenTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:StartOpenTimer.Interval = [TimeSpan]::FromMilliseconds(600)
+    $script:StartOpenTimer.add_Tick({
+      $script:StartOpenTimer.Stop()
+      $script:OpOpen = $false
+      Open-UI -FromTray
+    })
+    $script:StartOpenTimer.Start()
+  } elseif ($script:State -eq 'starting') {
+    # A cold start spends 10-20 s booting the VM before the unit answers. Show
+    # the flyout in its "starting" state so the launch is not silent; it closes
+    # itself when Complete-Start opens the browser, or stays on failure.
+    Start-LaunchPanel 'starting'
+  } elseif ($script:State -eq 'failed') {
+    # The port was taken by a foreign listener: say so instead of doing nothing.
+    Start-LaunchPanel 'failed' 8000
+  }
 }
 
 $script:Tray = New-Object System.Windows.Forms.NotifyIcon
@@ -1644,14 +2092,14 @@ $script:Tray.Visible = $true
 $script:Tray.add_MouseUp({
   param($s, $e)
   if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
-    Show-Panel
+    Show-Panel -Anchor
     return
   }
   if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
     $now = [DateTime]::Now
     if (($now - $script:LastOpen).TotalMilliseconds -lt 800) { return }
     $script:LastOpen = $now
-    Open-UI
+    Open-UI -FromTray
   }
 })
 
@@ -1683,9 +2131,12 @@ $script:HideTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:HideTimer.Interval = [TimeSpan]::FromMilliseconds($script:HideMs)
 $script:HideTimer.add_Tick({ $script:HideTimer.Stop(); $script:HideArmed = $false; Hide-Panel })
 
-$timer = New-Object System.Windows.Threading.DispatcherTimer
-$timer.Interval = [TimeSpan]::FromSeconds([Math]::Max(1, $script:PollSeconds))
-$timer.add_Tick({
+$script:PollTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:PollTimer.Interval = [TimeSpan]::FromSeconds([Math]::Max(1, $script:PollSeconds))
+$script:PollTimer.add_Tick({
+  # An exit is tearing the app down: touching the unit or the keeper here would
+  # resurrect what Exit-App is in the middle of stopping.
+  if ($script:Exiting) { return }
   if ($script:OpKind) { return }
   if ($script:Prewarming) { return }
   # The keeper is what keeps the VM (and therefore the unit) alive: without it
@@ -1746,13 +2197,16 @@ $timer.add_Tick({
   }
   if ((Get-PanelKey) -ne $before) { Update-PanelContent }
 })
-$timer.Start()
+$script:PollTimer.Start()
 
 # second launch pokes the running instance through a named event
 if ($script:PokeEvt) {
   $poke = New-Object System.Windows.Threading.DispatcherTimer
   $poke.Interval = [TimeSpan]::FromMilliseconds(700)
-  $poke.add_Tick({ if ($script:PokeEvt.WaitOne(0)) { Show-Panel } })
+  # A second launch of the shortcut is a request to see dsh: focus the tab that
+  # is already open, or open one. It used to drop the flyout next to the icon,
+  # which is not what a second double-click means.
+  $poke.add_Tick({ if ($script:PokeEvt.WaitOne(0)) { Open-UI -FromTray } })
   $poke.Start()
 }
 

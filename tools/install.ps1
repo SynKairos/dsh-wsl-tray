@@ -93,8 +93,11 @@ if ($r.Code -ne 0) { Warn ('enable-linger failed: ' + $r.Text) } else { Ok 'ling
 
 $r = Wsl 'systemctl --user daemon-reload'
 if ($r.Code -ne 0) { throw ('daemon-reload failed: ' + $r.Text) }
-$r = Wsl ('systemctl --user enable ' + $unit)
-if ($r.Code -ne 0) { Warn ('enable failed: ' + $r.Text) } else { Ok ('enabled ' + $unit) }
+# The tray owns the service lifetime: starting the VM (a terminal, VS Code, a
+# stray wsl.exe) must not bring dsh up behind the user's back. Disable is
+# idempotent and leaves the unit file in place.
+$r = Wsl ('systemctl --user disable ' + $unit)
+if ($r.Code -ne 0) { Warn ('disable failed: ' + $r.Text) } else { Ok ('left disabled (started only by the tray): ' + $unit) }
 
 $st = Wsl ('systemd-analyze verify ' + $linuxHome + '/.config/systemd/user/' + $unit + '.service 2>&1')
 if ($st.Code -ne 0) { Warn ('systemd-analyze verify: ' + $st.Text) } else { Ok 'unit file verified' }
