@@ -1758,18 +1758,23 @@ function Assert-NoTrayInstance {
   return $true
 }
 
-# Keeper probe: spawn the VM-holding client and report whether it is alive. The
-# kill-on-close job reaps it the moment this process exits.
+# Keeper probe: report the keeper this machine holds, spawning one only when
+# there is none. It must NOT adopt a keeper that belongs to a live tray: adopting
+# assigns it to this process's kill-on-close job, and this process exits right
+# away - which would take the live tray's VM holder down with it (observed
+# 2026-11-25 21:08, keeper 13188 died the moment the probe exited).
 if ($KeeperTest) {
+  $existing = @(Get-KeeperPids)
+  if ($existing.Count -gt 0) {
+    Write-Output 'keeper_started=True'
+    Write-Output ('keeper_alive=' + (Test-KeeperPid $existing[0]) + ' pid=' + $existing[0] + ' adopted=True')
+    Write-Output ('port=' + (Get-PortState))
+    exit 0
+  }
   $ok = Ensure-Keeper
   Start-Sleep -Seconds 3
-  $alive = $false
-  $kid = 0
-  if ($script:Keeper) {
-    try { $alive = -not $script:Keeper.HasExited; $kid = $script:Keeper.Id } catch { }
-  }
   Write-Output ('keeper_started=' + $ok)
-  Write-Output ('keeper_alive=' + $alive + ' pid=' + $kid)
+  Write-Output ('keeper_alive=' + (Test-KeeperPid $script:KeeperPid) + ' pid=' + $script:KeeperPid + ' adopted=False')
   Write-Output ('port=' + (Get-PortState))
   exit 0
 }

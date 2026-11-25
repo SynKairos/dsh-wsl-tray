@@ -158,7 +158,7 @@ pwsh -ExecutionPolicy Bypass -File tools\install.ps1        # 文件 + unit + li
 | `-TokenTest` | token 能否读到（只打印长度与哈希，不打印 token） |
 | `-ConfigTest` | 打印解析后的配置、日志路径与关键文件是否存在 |
 | `-ControllerTest` | 打印将执行的 systemctl 命令、unit 状态（不启停） |
-| `-KeeperTest` | 拉起 keeper 并报告存活；进程退出时由 Job Object 回收 |
+| `-KeeperTest` | 报告当前 keeper（已存在则只读复用，不认领；没有才拉起）；自己拉起的那个在进程退出时由 Job 回收 |
 | `-ReleaseTest` | 单独验证 keeper 释放路径（服务未运行时才生效） |
 | `-ExitTest` | **完整退出路径**：起服 → 走真实 `Exit-App` → 断言端口与 keeper 归零 |
 | `-PrewarmTest` | 预热探针：应输出 `panel_created=False`（启动时不得存在任何面板窗口） |
