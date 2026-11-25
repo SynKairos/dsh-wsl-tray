@@ -14,8 +14,8 @@ systemd 负责进程管理与自愈（`Restart=on-failure`），但它**不能**
 `loginctl enable-linger` 只让 user manager 在 VM 存活期间不被回收，救不了 VM 本身。
 
 所以托盘另外常驻一个 `wsl.exe … -- /bin/sleep infinity` 客户端（keeper）钉住 VM。它与
-dsh 没有父子关系，只负责"占位"：托盘重启会复用它，托盘退出时释放。这一步是上线后根据实际故障补上的（见
-[`改进方案`](../dsh-wsl-tray-改进方案.md) 第 15 节）。
+dsh 没有父子关系，只负责"占位"：托盘重启会复用它，托盘退出时释放。这一步是上线后根据
+真实故障补上的：托盘本身不持有 dsh，但必须有一个常驻客户端负责把 VM 钉住。
 
 ## 迁移前检查
 
