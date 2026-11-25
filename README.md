@@ -38,8 +38,9 @@ VM 还活着的期间不被回收，救不了 VM 本身。所以托盘额外常�
 
 keeper 被放进一个 `KILL_ON_JOB_CLOSE` 的 Job Object：**托盘无论怎么消失**（正常退出、
 崩溃、被 `taskkill`、注销），操作系统都会立刻回收它，不会留下一个持着 VM 的孤儿。
-代价是崩溃也会中断服务——这正是"图标即应用"的语义；要"托盘随便退、服务照跑"，把
-`config.stopOnExit` 设为 `false` 并接受 keeper 常驻。
+代价是崩溃也会中断服务——这正是"图标即应用"的语义。这里**没有**"托盘关了、服务照跑"的
+开关：那种模式与 kill-on-close 的回收保证无法同时成立；真需要服务脱离托盘常驻，应该让
+托盘之外的东西持有 VM（例如登录时由计划任务起一个 `wsl.exe`），而不是给托盘加一个模式。
 
 **为什么不让托盘持有 dsh**（旧方案）：那时 `wsl.exe` 是 dsh 的父进程，托盘一死服务就死。
 现在 dsh 的父进程是 systemd，`Restart=on-failure` 还能自愈；keeper 只负责"占位"，不参与
@@ -51,9 +52,7 @@ keeper 被放进一个 `KILL_ON_JOB_CLOSE` 的 Job Object：**托盘无论怎么
 | 右键托盘图标 | 弹出面板（打开界面 / 重启服务 / 停止服务 /（失败态）打开日志） |
 | 再双击一次快捷方式 | 聚焦已打开的那张标签页，而不是弹面板 |
 | 冷启动（服务未运行） | 面板自动弹出「启动中」，就绪后打开标签页并自动收起 |
-| 停止服务（默认） | 面板内联确认 → 停 unit → 释放 keeper → **退出托盘** |
-| 停止服务（`stopOnExit=false`） | 面板内联确认 → 停 unit，托盘保留 |
-| 退出托盘（`stopOnExit=false`） | 只关托盘；服务在跑就保留 keeper，服务没跑则顺手释放 |
+| 停止服务 | 面板内联确认 → 停 unit → 释放 keeper → **退出托盘** |
 | 重启服务 | 面板内联确认 → 停止 → 启动，托盘不退出 |
 | 状态点 | 每 3 秒判定：绿=运行 琥珀=启动中/停止中 灰=停止 红=失败（附原因行） |
 
@@ -66,8 +65,8 @@ keeper 被放进一个 `KILL_ON_JOB_CLOSE` 的 Job Object：**托盘无论怎么
 
 ## 退出契约
 
-默认（`stopOnExit=true`）下托盘图标就是应用。**图标消失意味着**：单元已 `stop`、keeper
-已释放、端口已释放、发行版回到 `Stopped`。实现必须按这个顺序：
+托盘图标就是应用。**图标消失意味着**：单元已 `stop`、keeper 已释放、端口已释放、发行版
+回到 `Stopped`。实现必须按这个顺序：
 
 1. 置 `Exiting` 标志并停掉所有 `DispatcherTimer` —— 3 秒轮询里的 keeper 重建逻辑会把刚
    杀掉的 keeper 又拉起来；
@@ -76,12 +75,9 @@ keeper 被放进一个 `KILL_ON_JOB_CLOSE` 的 Job Object：**托盘无论怎么
 4. 先 `Application.Shutdown()`，再 `Dispose` 图标与面板 —— 反过来的话，中途一个异常就会
    留下一个没有图标、没有窗口、只能从任务管理器杀掉的进程。
 
-附带结果：**`wsl --shutdown`、注销、重启都不会留下僵尸**。
-
-`config.stopOnExit=false` 是唯一例外：面板底部的「停止服务」变成"停服务但留在托盘"，并
-多出一行「退出托盘」；退出时如果服务仍在跑，keeper 会被保留（它此时**不**进
-kill-on-close Job，所以托盘崩溃也不会被回收），服务继续活着，下次启动托盘时复用同一个
-keeper。如果退出时端口已经没在监听，keeper 仍会被释放，免得白占着 VM。
+附带结果：**`wsl --shutdown`、注销、重启都不会留下僵尸**。这条路径没有例外开关，也
+不应该有：一个能在托盘退出后继续持有 VM 的 keeper，只能被排除在 Job 之外，于是崩溃时
+同样不会被回收——"退出可留"和"崩溃必清"在同一个进程模型里互斥。
 
 单元是 `disabled` 的：任何一次 `wsl.exe` 启动发行版都不会自动拉起 dsh，只有托盘能启动它。
 `loginctl enable-linger` 保持开启（让 user manager 随 VM 起来，托盘启动更快），它本身不产生残留。
@@ -147,7 +143,6 @@ pwsh -ExecutionPolicy Bypass -File tools\install.ps1        # 文件 + unit + li
 | `exitStopTimeoutSeconds` | `10` | 退出路径停服务的上限，超时对 cgroup 发 SIGKILL |
 | `pollSeconds` | `3` | 状态轮询间隔 |
 | `focusBrowser` | `true` | token 未变时优先聚焦已开的标签 |
-| `stopOnExit` | `true` | 退出时停服务；`false` 时「停止服务」留在托盘、另有「退出托盘」保留服务（keeper 不进 Job） |
 | `prewarmPanel` | `true` | 启动时离屏预热面板；怀疑启动闪烁可关掉做二分 |
 
 > 改端口要动两处：`config.port`（托盘探测与打开 URL）和 unit 的 `Environment=DSH_PORT`
@@ -163,7 +158,7 @@ pwsh -ExecutionPolicy Bypass -File tools\install.ps1        # 文件 + unit + li
 | `-TokenTest` | token 能否读到（只打印长度与哈希，不打印 token） |
 | `-ConfigTest` | 打印解析后的配置、日志路径与关键文件是否存在 |
 | `-ControllerTest` | 打印将执行的 systemctl 命令、unit 状态（不启停） |
-| `-KeeperTest` | 拉起 keeper 并报告存活；`stopOnExit=true` 时进程退出会由 Job Object 回收，`false` 时故意留下 |
+| `-KeeperTest` | 拉起 keeper 并报告存活；进程退出时由 Job Object 回收 |
 | `-ReleaseTest` | 单独验证 keeper 释放路径（服务未运行时才生效） |
 | `-ExitTest` | **完整退出路径**：起服 → 走真实 `Exit-App` → 断言端口与 keeper 归零 |
 | `-PrewarmTest` | 预热探针：应输出 `panel_created=False`（启动时不得存在任何面板窗口） |
@@ -201,8 +196,8 @@ abort 并 `exit 2`，避免诊断工具把正在用的实例拆掉。
   不匹配就开新标签；日志里 `[boot]` 标记之前的 token 一律视为过期。
 - **`%LOCALAPPDATA%` 下才自洽**：`.vbs`/`.ps1`/图标/文案/配置必须在同一目录。
 - 托盘基于 WPF，常驻约 200–250 MB。
-- **服务存活依赖 keeper 客户端**：默认模式下托盘退出、`wsl --shutdown`、注销或重启都会终止
-  它，服务随之停止（这是 WSL 的边界；本方案不做开机自启，按需双击快捷方式）。
+- **服务存活依赖 keeper 客户端**：托盘退出、`wsl --shutdown`、注销或重启都会终止它，服务
+  随之停止（这是 WSL 的边界；本方案不做开机自启，按需双击快捷方式）。
 - 图标缩到 16 px 时标记仍偏细：已按尺寸分别构图（小尺寸放大标记占比），但 koi 本身细节多。
 
 ## 安全说明
@@ -215,7 +210,7 @@ abort 并 `exit 2`，避免诊断工具把正在用的实例拆掉。
 
 ## 关于 PowerShell
 
-只有一个 `dsh-tray.ps1` 是 PowerShell（约 2200 行、74 个函数），其余是 137 行 bash 加一个
+只有一个 `dsh-tray.ps1` 是 PowerShell（约 2200 行、72 个函数），其余是 137 行 bash 加一个
 unit。选择它的理由是零构建、零依赖：WPF、`System.Drawing`、CIM 查询、COM 建快捷方式都在
 系统里，改一行存盘即生效。代价是 5.1 按 ANSI 解析（脚本必须纯 ASCII）、`add_Tick` 的
 scriptblock 不捕获局部变量（状态因此集中在 `$script:` 作用域）。若将来要做安装包、自动更新

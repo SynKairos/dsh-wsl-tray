@@ -68,8 +68,8 @@ try {
   $need = @('appName', 'tooltip', 'windowMarker', 'menuOpen', 'menuRestart', 'menuStop', 'menuLog',
     'statusRunning', 'statusStopped', 'statusStarting', 'statusStopping', 'statusFailed',
     'statusStopFailed', 'hintPortBusy', 'hintStartFail', 'hintStopFail', 'hintNoToken',
-    'hintLinger', 'hintNoUnit', 'menuExit', 'confirmStopHint', 'confirmOk',
-    'confirmStopKeepHint', 'confirmStopKeepOk', 'confirmRestartHint', 'confirmRestartOk', 'confirmCancel')
+    'hintLinger', 'hintNoUnit', 'confirmStopHint', 'confirmOk',
+    'confirmRestartHint', 'confirmRestartOk', 'confirmCancel')
   $miss = @()
   foreach ($k in $need) { if (-not $L.$k) { $miss += $k } }
   if ($miss.Count -gt 0) { Check ('labels=MISSING ' + ($miss -join ',')); $fail++ }

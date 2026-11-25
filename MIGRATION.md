@@ -14,8 +14,7 @@ systemd 负责进程管理与自愈（`Restart=on-failure`），但它**不能**
 `loginctl enable-linger` 只让 user manager 在 VM 存活期间不被回收，救不了 VM 本身。
 
 所以托盘另外常驻一个 `wsl.exe … -- /bin/sleep infinity` 客户端（keeper）钉住 VM。它与
-dsh 没有父子关系，只负责"占位"：托盘重启会复用它，托盘退出时按 `stopOnExit` 决定释放还是
-留下（默认释放，见下表）。这一步是上线后根据实际故障补上的（见
+dsh 没有父子关系，只负责"占位"：托盘重启会复用它，托盘退出时释放。这一步是上线后根据实际故障补上的（见
 [`改进方案`](../dsh-wsl-tray-改进方案.md) 第 15 节）。
 
 ## 迁移前检查
@@ -66,7 +65,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3080/   # 401
 手工确认三件事：
 
 1. 右键面板「停止服务」→「确认停止」后，图标消失、浏览器刷新变「无法访问」——
-   这是设计语义：托盘图标就是应用开关（`stopOnExit` 可关掉这个行为）。
+   这是设计语义：托盘图标就是应用开关。
 2. 再双击快捷方式，托盘回来、服务重新起来、标签页自动打开。
 3. `systemctl --user restart dsh-web` 之后，左键托盘能用新 token 打开界面（旧标签会 401）。
 
@@ -86,8 +85,8 @@ pwsh -ExecutionPolicy Bypass -File tools\rollback.ps1 -Backup <dir>  # 指定备
 | 项 | 旧架构 | 新架构 |
 |---|---|---|
 | 服务归属 | 托盘（前台 wsl.exe） | systemd 用户单元 |
-| 托盘退出 | 服务停止 | 服务停止，图标消失即应用关闭（`stopOnExit=false` 可保留服务） |
-| 托盘崩溃 | 服务停止 | 服务在 10–30 秒后随 VM 停止（keeper 在 kill-on-close Job 里；`stopOnExit=false` 时它不在 Job 内，服务继续） |
+| 托盘退出 | 服务停止 | 服务停止，图标消失即应用关闭 |
+| 托盘崩溃 | 服务停止 | 服务在 10–30 秒后随 VM 停止（keeper 在 kill-on-close Job 里，被 OS 回收） |
 | dsh 崩溃 | 面板变灰，不自动拉起 | `Restart=on-failure` 3 秒后自动重启 |
 | Windows 注销 | 服务停止 | 服务停止（keeper 随会话结束） |
 | 发行版存活 | 托盘的前台 `wsl.exe`（同时持有 dsh） | keeper 常驻客户端（只占位，不持有 dsh） |

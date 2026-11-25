@@ -74,10 +74,6 @@ $script:Defaults = [ordered]@{
   stopTimeoutSeconds  = 25
   pollSeconds         = 3
   focusBrowser        = $true
-  # Closing the tray icon means "quit the app", not "close a window": the unit
-  # is stopped and the VM-holding keeper is killed, leaving nothing behind.
-  # Set to false only if you want the web UI to outlive the tray.
-  stopOnExit          = $true
   exitStopTimeoutSeconds = 10
   # Offscreen warm-up of the panel at startup. Off only for bisecting a flash.
   prewarmPanel        = $true
@@ -127,7 +123,6 @@ $script:StopConfirm = [bool]$C.stopConfirm
 $script:StartTimeout = [int]$C.startTimeoutSeconds
 $script:StopTimeout  = [int]$C.stopTimeoutSeconds
 $script:PollSeconds  = [int]$C.pollSeconds
-$script:StopOnExit   = [bool]$C.stopOnExit
 $script:ExitStopTimeout = [int]$C.exitStopTimeoutSeconds
 $script:PrewarmEnabled = [bool]$C.prewarmPanel
 if ($script:ExitStopTimeout -lt 3) { $script:ExitStopTimeout = 3 }
@@ -724,21 +719,15 @@ function New-Panel {
   $sep2.Margin = Thick 12 6 12 6
   [void]$outer.Children.Add($sep2)
 
-  # One row, one meaning. With stopOnExit (the default) stopping the service and
-  # quitting are the same action: the icon is the app. With stopOnExit=false the
-  # panel must not pretend otherwise, so it offers "stop but stay" and a separate
-  # "quit" row - a "stop" that left the service running would be a lie.
-  # Both destructive rows ask their question inline: same tokens as the panel,
-  # instead of a Win32 MessageBox that can never match this surface.
-  # Red = it also ends the app; amber = it only interrupts the service.
+  # One row, one meaning: the icon is the app, so stopping the service and
+  # quitting are the same action. Both destructive rows ask their question
+  # inline, with the panel's own tokens, instead of a Win32 MessageBox that can
+  # never match this surface. Red = it also ends the app; amber = it only
+  # interrupts the service.
   if ($Confirm) {
     $isRestart = ($Confirm -eq 'restart')
     $hintKey = 'confirmStopHint'; $okKey = 'confirmOk'
     $actGlyph = 'E7E8'; $actColor = $C_Red; $actHover = $C_RedHover
-    if ($Confirm -eq 'stopkeep') {
-      $hintKey = 'confirmStopKeepHint'; $okKey = 'confirmStopKeepOk'
-      $actColor = $C_Amber; $actHover = $C_AmberHover
-    }
     if ($isRestart) {
       $hintKey = 'confirmRestartHint'; $okKey = 'confirmRestartOk'
       $actGlyph = 'E72C'; $actColor = $C_Amber; $actHover = $C_AmberHover
@@ -755,9 +744,6 @@ function New-Panel {
     $exitRow = New-Row -Glyph 'E7E8' -Label $L.menuStop -OnClick { Ask-Stop }
     $exitRow.Margin = Thick 6 1 6 5
     [void]$outer.Children.Add($exitRow)
-    if (-not $script:StopOnExit) {
-      [void]$outer.Children.Add((New-Row -Glyph 'E711' -Label $L.menuExit -OnClick { Exit-App }))
-    }
   }
 
   $root.Child = $outer
@@ -953,22 +939,17 @@ function Ensure-Keeper {
   if (Test-KeeperAlive) {
     Write-TrayLog ('keeper: already held by another client pid=' + $script:KeeperPid)
     # An adopted keeper is only covered by the kill-on-close job if it is
-    # assigned here. Without that, a tray crash would leave it holding the VM
-    # even though stopOnExit promises the app dies with its icon.
-    if ($script:StopOnExit) {
-      [void](Initialize-KeeperJob)
-      try { [void](Add-KeeperToJob (Get-Process -Id $script:KeeperPid -ErrorAction Stop)) } catch { }
-    }
+    # assigned here; otherwise a tray crash would leave it holding the VM.
+    [void](Initialize-KeeperJob)
+    try { [void](Add-KeeperToJob (Get-Process -Id $script:KeeperPid -ErrorAction Stop)) } catch { }
     return $true
   }
   try {
-    # The job only exists for the "icon is the app" mode. With stopOnExit=false
-    # the keeper must outlive this process, so it stays job-less on purpose.
-    if ($script:StopOnExit) { [void](Initialize-KeeperJob) }
+    [void](Initialize-KeeperJob)
     $script:Keeper = New-KeeperProcess ($WslBase + '/bin/sleep infinity')
     $script:KeeperPid = $script:Keeper.Id
-    if ($script:StopOnExit) { [void](Add-KeeperToJob $script:Keeper) }
-    Write-TrayLog ('keeper: spawned pid=' + $script:KeeperPid + ' job=' + $script:StopOnExit)
+    [void](Add-KeeperToJob $script:Keeper)
+    Write-TrayLog ('keeper: spawned pid=' + $script:KeeperPid)
     return $true
   } catch {
     Write-TrayLog ('keeper: spawn failed: ' + $_.Exception.Message) 'error'
@@ -1051,7 +1032,15 @@ function Complete-Stop([bool]$Ok) {
   }
   Write-TrayLog ('stop -> ok=' + $Ok)
   Update-PanelContent
-  if ($Ok -and $next -eq 'start') { [void](Begin-Start) }
+  if ($Ok -and $next -eq 'start') {
+    # Restart: the VM must stay up for the start that follows.
+    [void](Begin-Start)
+  } elseif ($Ok) {
+    # Nothing is serving any more, so nothing needs the VM held. Without this a
+    # stop that is not immediately followed by a start leaves an idle keeper
+    # pinning the distro until the tray exits.
+    [void](Release-Keeper)
+  }
 }
 
 function Update-Op {
@@ -1191,15 +1180,8 @@ function Start-Confirm([string]$Kind) {
 }
 
 function Ask-Stop {
-  # stopOnExit=false keeps the tray alive, so "stop" must stop without exiting;
-  # the extra quit row in the panel calls Exit-App directly.
-  $kind = 'stop'
-  if (-not $script:StopOnExit) { $kind = 'stopkeep' }
-  if (-not $script:StopConfirm) {
-    if ($kind -eq 'stopkeep') { Begin-Stop } else { Exit-App }
-    return
-  }
-  Start-Confirm $kind
+  if (-not $script:StopConfirm) { Exit-App; return }
+  Start-Confirm 'stop'
 }
 
 function Ask-Restart {
@@ -1217,7 +1199,6 @@ function Confirm-Action {
   $kind = $script:ConfirmKind
   $script:ConfirmKind = ''
   if ($kind -eq 'restart') { Do-Restart; return }
-  if ($kind -eq 'stopkeep') { Begin-Stop; return }
   Exit-App
 }
 
@@ -1548,17 +1529,16 @@ function Start-LaunchPanel([string]$When, [int]$HideMs = 0) {
 
 # --- exit path --------------------------------------------------------------
 # Contract: the tray icon IS the app. Once it disappears nothing of dsh may keep
-# running - not the unit, not the keeper, not the VM. `stopOnExit=false` is the
-# one documented exception: it leaves the unit and the keeper alone, and the
-# keeper is deliberately kept out of the kill-on-close job (see Ensure-Keeper).
-# Two things make the default contract harder than it looks:
+# running - not the unit, not the keeper, not the VM. There is deliberately no
+# "quit but keep serving" mode: it cannot be expressed consistently with a
+# kill-on-close job, and a second lifecycle owner belongs outside the tray.
+# Two things make the contract harder than it looks:
 #   1) the unit belongs to systemd, so it outlives this process by design;
 #   2) the poll tick re-acquires the keeper whenever the port answers, so a
 #      keeper killed before the unit is stopped comes back within 3 seconds.
 # Hence the order: flag -> stop polling -> stop unit -> wait for the port ->
-# kill the keeper, and in the default mode the keep-alive is released whatever
-# happens. Extracted so the release path can also be exercised headless
-# (-ReleaseTest).
+# kill the keeper; the keep-alive is released whatever happens. Extracted so the
+# release path can also be exercised headless (-ReleaseTest).
 function Release-Keeper([switch]$Force) {
   if (-not $Force) {
     if ((Test-Up) -or $script:OpKind) {
@@ -1638,30 +1618,14 @@ function Exit-App {
     # the moment they click, even though the teardown below takes a second or two.
     if ($script:Tray) { try { $script:Tray.Visible = $false } catch { } }
     if ($script:Panel) { try { $script:Panel.Hide() } catch { } }
-    if ($script:StopOnExit) {
-      $stopped = Stop-ServiceNow $script:ExitStopTimeout
-      Write-TrayLog ('exit: service stopped=' + $stopped)
-    } else {
-      Write-TrayLog 'exit: stopOnExit=false, unit left running'
-    }
+    $stopped = Stop-ServiceNow $script:ExitStopTimeout
+    Write-TrayLog ('exit: service stopped=' + $stopped)
   } catch {
     Write-TrayLog ('exit: teardown error: ' + $_.Exception.Message) 'error'
   } finally {
-    if ($script:StopOnExit) {
-      # Force, not IfIdle: after a stop request the keeper must go even if a
-      # leftover listener still answers - the VM teardown finishes the job.
-      try { [void](Release-Keeper -Force) } catch { Write-TrayLog ('exit: keeper release failed: ' + $_.Exception.Message) 'error' }
-    } else {
-      # stopOnExit=false: the unit keeps serving, so its keeper must survive this
-      # process (it is job-less for exactly this reason). With nothing listening
-      # there is nothing to hold, so release it and let the VM go idle.
-      if (Test-Up) {
-        Write-TrayLog ('exit: keeper left running (stopOnExit=false) pid=' + $script:KeeperPid)
-      } else {
-        try { [void](Release-Keeper -Force) } catch { }
-        Write-TrayLog 'exit: nothing listening, keeper released anyway (stopOnExit=false)'
-      }
-    }
+    # Force, not IfIdle: after a stop request the keeper must go even if a
+    # leftover listener still answers - the VM teardown finishes the job.
+    try { [void](Release-Keeper -Force) } catch { Write-TrayLog ('exit: keeper release failed: ' + $_.Exception.Message) 'error' }
     try { if ($script:Mutex) { $script:Mutex.ReleaseMutex() } } catch { }
     $script:Run = $false
     # Shutdown BEFORE disposing the UI objects: the old order disposed the icon
@@ -1794,9 +1758,8 @@ function Assert-NoTrayInstance {
   return $true
 }
 
-# Keeper probe: spawn the VM-holding client and report whether it is alive. With
-# stopOnExit=true the kill-on-close job reaps it the moment this process exits;
-# with stopOnExit=false it is left behind on purpose so the distro stays up.
+# Keeper probe: spawn the VM-holding client and report whether it is alive. The
+# kill-on-close job reaps it the moment this process exits.
 if ($KeeperTest) {
   $ok = Ensure-Keeper
   Start-Sleep -Seconds 3
@@ -1834,7 +1797,7 @@ if ($ExitTest) {
   $lines = New-Object System.Collections.ArrayList
   function Note([string]$s) { [void]$lines.Add($s); Write-Output $s }
   try {
-    Note ('stopOnExit=' + $script:StopOnExit + ' exitStopTimeout=' + $script:ExitStopTimeout)
+    Note ('exitStopTimeout=' + $script:ExitStopTimeout)
     [void](Ensure-Keeper)
     # A cold VM needs ten-plus seconds just to boot, so the start gets a wide
     # deadline and one retry: a timeout here is a measurement artefact, not a
@@ -1889,7 +1852,7 @@ if ($ConfigTest) {
   Write-Output ('user     = ' + $script:LinuxUser)
   Write-Output ('endpoint = ' + $script:BindHost + ':' + $script:Port)
   Write-Output ('unit     = ' + $script:Unit)
-  Write-Output ('stopOnExit=' + $script:StopOnExit + ' exitStopTimeout=' + $script:ExitStopTimeout + ' prewarm=' + $script:PrewarmEnabled)
+  Write-Output ('exitStopTimeout=' + $script:ExitStopTimeout + ' prewarm=' + $script:PrewarmEnabled)
   Write-Output ('logunc   = ' + $LogUnc)
   Write-Output ('logexists= ' + (Test-Path $LogUnc))
   foreach ($f in @($ConfigFile, $IcoPath, $LabelFile)) {
