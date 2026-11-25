@@ -724,9 +724,10 @@ function New-Panel {
   $sep2.Margin = Thick 12 6 12 6
   [void]$outer.Children.Add($sep2)
 
-  # One row, one meaning: the icon is the app, so stopping the service and
-  # quitting are the same action. A separate "stop but stay resident" entry is
-  # deliberately gone - it would leave an icon whose only remaining use is to die.
+  # One row, one meaning. With stopOnExit (the default) stopping the service and
+  # quitting are the same action: the icon is the app. With stopOnExit=false the
+  # panel must not pretend otherwise, so it offers "stop but stay" and a separate
+  # "quit" row - a "stop" that left the service running would be a lie.
   # Both destructive rows ask their question inline: same tokens as the panel,
   # instead of a Win32 MessageBox that can never match this surface.
   # Red = it also ends the app; amber = it only interrupts the service.
@@ -734,6 +735,10 @@ function New-Panel {
     $isRestart = ($Confirm -eq 'restart')
     $hintKey = 'confirmStopHint'; $okKey = 'confirmOk'
     $actGlyph = 'E7E8'; $actColor = $C_Red; $actHover = $C_RedHover
+    if ($Confirm -eq 'stopkeep') {
+      $hintKey = 'confirmStopKeepHint'; $okKey = 'confirmStopKeepOk'
+      $actColor = $C_Amber; $actHover = $C_AmberHover
+    }
     if ($isRestart) {
       $hintKey = 'confirmRestartHint'; $okKey = 'confirmRestartOk'
       $actGlyph = 'E72C'; $actColor = $C_Amber; $actHover = $C_AmberHover
@@ -750,6 +755,9 @@ function New-Panel {
     $exitRow = New-Row -Glyph 'E7E8' -Label $L.menuStop -OnClick { Ask-Stop }
     $exitRow.Margin = Thick 6 1 6 5
     [void]$outer.Children.Add($exitRow)
+    if (-not $script:StopOnExit) {
+      [void]$outer.Children.Add((New-Row -Glyph 'E711' -Label $L.menuExit -OnClick { Exit-App }))
+    }
   }
 
   $root.Child = $outer
@@ -944,14 +952,23 @@ function Ensure-Keeper {
   if (Test-KeeperPid $script:KeeperPid) { return $true }
   if (Test-KeeperAlive) {
     Write-TrayLog ('keeper: already held by another client pid=' + $script:KeeperPid)
+    # An adopted keeper is only covered by the kill-on-close job if it is
+    # assigned here. Without that, a tray crash would leave it holding the VM
+    # even though stopOnExit promises the app dies with its icon.
+    if ($script:StopOnExit) {
+      [void](Initialize-KeeperJob)
+      try { [void](Add-KeeperToJob (Get-Process -Id $script:KeeperPid -ErrorAction Stop)) } catch { }
+    }
     return $true
   }
   try {
-    [void](Initialize-KeeperJob)
+    # The job only exists for the "icon is the app" mode. With stopOnExit=false
+    # the keeper must outlive this process, so it stays job-less on purpose.
+    if ($script:StopOnExit) { [void](Initialize-KeeperJob) }
     $script:Keeper = New-KeeperProcess ($WslBase + '/bin/sleep infinity')
     $script:KeeperPid = $script:Keeper.Id
-    [void](Add-KeeperToJob $script:Keeper)
-    Write-TrayLog ('keeper: spawned pid=' + $script:KeeperPid)
+    if ($script:StopOnExit) { [void](Add-KeeperToJob $script:Keeper) }
+    Write-TrayLog ('keeper: spawned pid=' + $script:KeeperPid + ' job=' + $script:StopOnExit)
     return $true
   } catch {
     Write-TrayLog ('keeper: spawn failed: ' + $_.Exception.Message) 'error'
@@ -1174,8 +1191,15 @@ function Start-Confirm([string]$Kind) {
 }
 
 function Ask-Stop {
-  if (-not $script:StopConfirm) { Exit-App; return }
-  Start-Confirm 'stop'
+  # stopOnExit=false keeps the tray alive, so "stop" must stop without exiting;
+  # the extra quit row in the panel calls Exit-App directly.
+  $kind = 'stop'
+  if (-not $script:StopOnExit) { $kind = 'stopkeep' }
+  if (-not $script:StopConfirm) {
+    if ($kind -eq 'stopkeep') { Begin-Stop } else { Exit-App }
+    return
+  }
+  Start-Confirm $kind
 }
 
 function Ask-Restart {
@@ -1193,6 +1217,7 @@ function Confirm-Action {
   $kind = $script:ConfirmKind
   $script:ConfirmKind = ''
   if ($kind -eq 'restart') { Do-Restart; return }
+  if ($kind -eq 'stopkeep') { Begin-Stop; return }
   Exit-App
 }
 
@@ -1374,13 +1399,6 @@ function Get-PanelPlacement {
 }
 
 $script:PanelCache = @{}
-$script:Phase      = $false
-$script:PhaseMarks = New-Object System.Collections.ArrayList
-
-function Mark {
-  param([string]$Label, $Sw)
-  if ($script:Phase -and $Sw) { [void]$script:PhaseMarks.Add($Label + '=' + $Sw.ElapsedMilliseconds) }
-}
 
 # One cached visual tree per (state, reason) keeps a click from rebuilding ~40
 # text elements, re-decoding the icon and re-parsing hex colors.
@@ -1463,8 +1481,6 @@ function Prewarm-Panel {
 
 function Show-Panel {
   param([switch]$Anchor)
-  $swP = $null
-  if ($script:Phase) { $swP = [System.Diagnostics.Stopwatch]::StartNew() }
   # Capture the anchor only when the caller says the click that opened the panel
   # is here. Every other re-show reuses the stored one: by then the pointer is
   # inside the panel, and taking it for an anchor drags the panel up-left.
@@ -1487,14 +1503,11 @@ function Show-Panel {
       $script:State = 'stopped'
     }
   }
-  Mark 'probe' $swP
   Ensure-PanelWindow
   $entry = Get-PanelEntry -State $script:State -Reason $script:Reason -Confirm $script:ConfirmKind
   $script:ShownKey = Get-PanelKey
-  Mark 'entry' $swP
   $script:Panel.Content = $entry.Content
   $pl = Get-PanelPlacement -H $entry.H -Cx $script:AnchorX -Cy $script:AnchorY
-  Mark 'place' $swP
   $script:Panel.Left = $pl.Left
   $script:Panel.Top  = $pl.Top
   $script:Panel.ShowActivated = $true
@@ -1508,10 +1521,8 @@ function Show-Panel {
     $script:Panel.BeginAnimation([System.Windows.Window]::OpacityProperty, $null)
     $script:Panel.Opacity = 1.0
   }
-  Mark 'show' $swP
   $script:Panel.Activate()
   if (-not $already) { Start-FadeIn }
-  Mark 'activate' $swP
 }
 
 # The launch-time flyout. Delayed one beat so the window is not composed before
@@ -1537,14 +1548,17 @@ function Start-LaunchPanel([string]$When, [int]$HideMs = 0) {
 
 # --- exit path --------------------------------------------------------------
 # Contract: the tray icon IS the app. Once it disappears nothing of dsh may keep
-# running - not the unit, not the keeper, not the VM.
-# Two things make that harder than it looks:
+# running - not the unit, not the keeper, not the VM. `stopOnExit=false` is the
+# one documented exception: it leaves the unit and the keeper alone, and the
+# keeper is deliberately kept out of the kill-on-close job (see Ensure-Keeper).
+# Two things make the default contract harder than it looks:
 #   1) the unit belongs to systemd, so it outlives this process by design;
 #   2) the poll tick re-acquires the keeper whenever the port answers, so a
 #      keeper killed before the unit is stopped comes back within 3 seconds.
 # Hence the order: flag -> stop polling -> stop unit -> wait for the port ->
-# kill the keeper, and the keep-alive must be released whatever happens.
-# Extracted so the release path can also be exercised headless (-ReleaseTest).
+# kill the keeper, and in the default mode the keep-alive is released whatever
+# happens. Extracted so the release path can also be exercised headless
+# (-ReleaseTest).
 function Release-Keeper([switch]$Force) {
   if (-not $Force) {
     if ((Test-Up) -or $script:OpKind) {
@@ -1563,15 +1577,15 @@ function Release-Keeper([switch]$Force) {
   return $true
 }
 
-function Release-KeeperIfIdle { return (Release-Keeper) }
-
 # Synchronous stop used only on the exit path. The icon is already hidden, so
 # blocking the dispatcher is acceptable here and much simpler than driving the
 # async state machine while tearing it down.
 function Stop-ServiceNow {
   param([int]$TimeoutSec = 10)
   Write-TrayLog ('exit: systemctl --user stop ' + $script:Unit)
-  $r = Invoke-Systemctl 'stop'
+  # Match the client wait to the overall budget: the unit's own TimeoutStopSec is
+  # 20 s, so an 8 s client timeout would abandon a stop that was still working.
+  $r = Invoke-Systemctl 'stop' '' ([Math]::Max(5000, $TimeoutSec * 1000))
   Write-TrayLog ('exit: stop rc=' + $r.Code + ' text=' + $r.Text)
   $deadline = [DateTime]::Now.AddSeconds($TimeoutSec)
   while ([DateTime]::Now -lt $deadline) {
@@ -1633,9 +1647,21 @@ function Exit-App {
   } catch {
     Write-TrayLog ('exit: teardown error: ' + $_.Exception.Message) 'error'
   } finally {
-    # Force, not IfIdle: after a stop request the keeper must go even if a
-    # leftover listener still answers - the VM teardown finishes the job.
-    try { [void](Release-Keeper -Force) } catch { Write-TrayLog ('exit: keeper release failed: ' + $_.Exception.Message) 'error' }
+    if ($script:StopOnExit) {
+      # Force, not IfIdle: after a stop request the keeper must go even if a
+      # leftover listener still answers - the VM teardown finishes the job.
+      try { [void](Release-Keeper -Force) } catch { Write-TrayLog ('exit: keeper release failed: ' + $_.Exception.Message) 'error' }
+    } else {
+      # stopOnExit=false: the unit keeps serving, so its keeper must survive this
+      # process (it is job-less for exactly this reason). With nothing listening
+      # there is nothing to hold, so release it and let the VM go idle.
+      if (Test-Up) {
+        Write-TrayLog ('exit: keeper left running (stopOnExit=false) pid=' + $script:KeeperPid)
+      } else {
+        try { [void](Release-Keeper -Force) } catch { }
+        Write-TrayLog 'exit: nothing listening, keeper released anyway (stopOnExit=false)'
+      }
+    }
     try { if ($script:Mutex) { $script:Mutex.ReleaseMutex() } } catch { }
     $script:Run = $false
     # Shutdown BEFORE disposing the UI objects: the old order disposed the icon
@@ -1768,9 +1794,9 @@ function Assert-NoTrayInstance {
   return $true
 }
 
-# Keeper probe: spawn the VM-holding client and exit without killing it, so an
-# outside observer can tell whether the distro survives once the spawning process
-# is gone. Leaves the keeper behind on purpose.
+# Keeper probe: spawn the VM-holding client and report whether it is alive. With
+# stopOnExit=true the kill-on-close job reaps it the moment this process exits;
+# with stopOnExit=false it is left behind on purpose so the distro stays up.
 if ($KeeperTest) {
   $ok = Ensure-Keeper
   Start-Sleep -Seconds 3
@@ -1791,7 +1817,7 @@ if ($ReleaseTest) {
   if (-not (Assert-NoTrayInstance)) { exit 2 }
   Write-Output ('port_up=' + (Test-Up))
   Write-Output ('keepers_before=' + (@(Get-KeeperPids) -join ','))
-  $r = Release-KeeperIfIdle
+  $r = Release-Keeper
   Start-Sleep -Milliseconds 800
   Write-Output ('released=' + $r)
   Write-Output ('keepers_after=' + (@(Get-KeeperPids) -join ','))
@@ -1841,11 +1867,11 @@ if ($ExitTest) {
   exit 0
 }
 
-# Configuration resolution: prints what every other switch would use, without
-# touching the service. Run it right after editing dsh-tray.config.json.
 # Warm-up probe: the panel must not exist as a window at startup. A visible
-# window here is exactly the launch flash users reported.
+# window here is exactly the launch flash users reported. The probe forces the
+# warm-up on even when config disables it, otherwise it would assert nothing.
 if ($PrewarmTest) {
+  $script:PrewarmEnabled = $true
   $t0 = [DateTime]::Now
   $ok = Prewarm-Panel
   $ms = [int]([DateTime]::Now - $t0).TotalMilliseconds
@@ -1855,6 +1881,8 @@ if ($PrewarmTest) {
   exit 0
 }
 
+# Configuration resolution: prints what every other switch would use, without
+# touching the service. Run it right after editing dsh-tray.config.json.
 if ($ConfigTest) {
   Write-Output ('config   = ' + $ConfigFile)
   Write-Output ('distro   = ' + $script:Distro)

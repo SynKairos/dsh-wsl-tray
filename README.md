@@ -51,7 +51,9 @@ keeper 被放进一个 `KILL_ON_JOB_CLOSE` 的 Job Object：**托盘无论怎么
 | 右键托盘图标 | 弹出面板（打开界面 / 重启服务 / 停止服务 /（失败态）打开日志） |
 | 再双击一次快捷方式 | 聚焦已打开的那张标签页，而不是弹面板 |
 | 冷启动（服务未运行） | 面板自动弹出「启动中」，就绪后打开标签页并自动收起 |
-| 停止服务 | 面板内联确认 → 停 unit → 释放 keeper → **退出托盘** |
+| 停止服务（默认） | 面板内联确认 → 停 unit → 释放 keeper → **退出托盘** |
+| 停止服务（`stopOnExit=false`） | 面板内联确认 → 停 unit，托盘保留 |
+| 退出托盘（`stopOnExit=false`） | 只关托盘；服务在跑就保留 keeper，服务没跑则顺手释放 |
 | 重启服务 | 面板内联确认 → 停止 → 启动，托盘不退出 |
 | 状态点 | 每 3 秒判定：绿=运行 琥珀=启动中/停止中 灰=停止 红=失败（附原因行） |
 
@@ -64,8 +66,8 @@ keeper 被放进一个 `KILL_ON_JOB_CLOSE` 的 Job Object：**托盘无论怎么
 
 ## 退出契约
 
-托盘图标就是应用。**图标消失意味着**：单元已 `stop`、keeper 已释放、端口已释放、发行版
-回到 `Stopped`。实现必须按这个顺序：
+默认（`stopOnExit=true`）下托盘图标就是应用。**图标消失意味着**：单元已 `stop`、keeper
+已释放、端口已释放、发行版回到 `Stopped`。实现必须按这个顺序：
 
 1. 置 `Exiting` 标志并停掉所有 `DispatcherTimer` —— 3 秒轮询里的 keeper 重建逻辑会把刚
    杀掉的 keeper 又拉起来；
@@ -74,8 +76,12 @@ keeper 被放进一个 `KILL_ON_JOB_CLOSE` 的 Job Object：**托盘无论怎么
 4. 先 `Application.Shutdown()`，再 `Dispose` 图标与面板 —— 反过来的话，中途一个异常就会
    留下一个没有图标、没有窗口、只能从任务管理器杀掉的进程。
 
-附带结果：**`wsl --shutdown`、注销、重启都不会留下僵尸**；想看服务在托盘之外常驻，把
-`config.stopOnExit` 设为 `false`。
+附带结果：**`wsl --shutdown`、注销、重启都不会留下僵尸**。
+
+`config.stopOnExit=false` 是唯一例外：面板底部的「停止服务」变成"停服务但留在托盘"，并
+多出一行「退出托盘」；退出时如果服务仍在跑，keeper 会被保留（它此时**不**进
+kill-on-close Job，所以托盘崩溃也不会被回收），服务继续活着，下次启动托盘时复用同一个
+keeper。如果退出时端口已经没在监听，keeper 仍会被释放，免得白占着 VM。
 
 单元是 `disabled` 的：任何一次 `wsl.exe` 启动发行版都不会自动拉起 dsh，只有托盘能启动它。
 `loginctl enable-linger` 保持开启（让 user manager 随 VM 起来，托盘启动更快），它本身不产生残留。
@@ -141,7 +147,7 @@ pwsh -ExecutionPolicy Bypass -File tools\install.ps1        # 文件 + unit + li
 | `exitStopTimeoutSeconds` | `10` | 退出路径停服务的上限，超时对 cgroup 发 SIGKILL |
 | `pollSeconds` | `3` | 状态轮询间隔 |
 | `focusBrowser` | `true` | token 未变时优先聚焦已开的标签 |
-| `stopOnExit` | `true` | 退出时停服务；`false` 则退出只是关面板（服务继续跑） |
+| `stopOnExit` | `true` | 退出时停服务；`false` 时「停止服务」留在托盘、另有「退出托盘」保留服务（keeper 不进 Job） |
 | `prewarmPanel` | `true` | 启动时离屏预热面板；怀疑启动闪烁可关掉做二分 |
 
 > 改端口要动两处：`config.port`（托盘探测与打开 URL）和 unit 的 `Environment=DSH_PORT`
@@ -157,7 +163,7 @@ pwsh -ExecutionPolicy Bypass -File tools\install.ps1        # 文件 + unit + li
 | `-TokenTest` | token 能否读到（只打印长度与哈希，不打印 token） |
 | `-ConfigTest` | 打印解析后的配置、日志路径与关键文件是否存在 |
 | `-ControllerTest` | 打印将执行的 systemctl 命令、unit 状态（不启停） |
-| `-KeeperTest` | 拉起 keeper 并报告存活；进程退出时 Job Object 会把它回收 |
+| `-KeeperTest` | 拉起 keeper 并报告存活；`stopOnExit=true` 时进程退出会由 Job Object 回收，`false` 时故意留下 |
 | `-ReleaseTest` | 单独验证 keeper 释放路径（服务未运行时才生效） |
 | `-ExitTest` | **完整退出路径**：起服 → 走真实 `Exit-App` → 断言端口与 keeper 归零 |
 | `-PrewarmTest` | 预热探针：应输出 `panel_created=False`（启动时不得存在任何面板窗口） |
@@ -195,8 +201,8 @@ abort 并 `exit 2`，避免诊断工具把正在用的实例拆掉。
   不匹配就开新标签；日志里 `[boot]` 标记之前的 token 一律视为过期。
 - **`%LOCALAPPDATA%` 下才自洽**：`.vbs`/`.ps1`/图标/文案/配置必须在同一目录。
 - 托盘基于 WPF，常驻约 200–250 MB。
-- **服务存活依赖 keeper 客户端**：托盘退出、`wsl --shutdown`、注销或重启都会终止它，服务
-  随之停止（这是 WSL 的边界；本方案不做开机自启，按需双击快捷方式）。
+- **服务存活依赖 keeper 客户端**：默认模式下托盘退出、`wsl --shutdown`、注销或重启都会终止
+  它，服务随之停止（这是 WSL 的边界；本方案不做开机自启，按需双击快捷方式）。
 - 图标缩到 16 px 时标记仍偏细：已按尺寸分别构图（小尺寸放大标记占比），但 koi 本身细节多。
 
 ## 安全说明
