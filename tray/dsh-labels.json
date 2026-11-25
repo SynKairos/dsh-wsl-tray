@@ -1,0 +1,21 @@
+{
+  "appName": "DeepSeek Harness",
+  "tooltip": "DeepSeek Harness · 左键打开 · 右键菜单",
+  "windowMarker": "DeepSeek Harness",
+  "statusRunning": "运行中",
+  "statusStopped": "已停止",
+  "statusStarting": "启动中",
+  "statusStopping": "停止中",
+  "statusFailed": "启动失败",
+  "statusStopFailed": "停止失败",
+  "dotSep": "·",
+  "menuOpen": "打开界面",
+  "menuRestart": "重启服务",
+  "menuStop": "停止服务",
+  "menuLog": "打开日志",
+  "menuExit": "退出托盘",
+  "hintPortBusy": "3080 被其他程序占用，服务未启动",
+  "hintStartFail": "启动未成功，请查看日志",
+  "hintStopFail": "停止未生效，服务仍在运行",
+  "hintNoToken": "未取到访问令牌，请查看日志"
+}

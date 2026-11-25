@@ -1,0 +1,16 @@
+# internal notes stay local: they mention machine specifics and unfinished work
+docs/
+.workbuddy/
+_internal/
+
+# deploy-time artefacts
+*.bak
+*.bak-*
+panel-*.png
+!assets/panel.png
+selftest.txt
+last-token.sha
+
+# scratch
+*.log
+*.tmp
