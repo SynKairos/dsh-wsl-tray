@@ -25,6 +25,18 @@ function Wsl([string]$Command) {
   return @{ Code = $LASTEXITCODE; Text = (($out | Out-String).Trim()) }
 }
 
+function Test-Tcp([int]$Port) {
+  $c = $null
+  try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $ar = $c.BeginConnect('127.0.0.1', $Port, $null, $null)
+    if (-not $ar.AsyncWaitHandle.WaitOne(300, $false)) { return $false }
+    $c.EndConnect($ar)
+    return $true
+  } catch { return $false }
+  finally { if ($c) { try { $c.Close() } catch { } } }
+}
+
 $cfgPath = Join-Path $Root 'dsh-tray.config.json'
 if (-not (Test-Path $cfgPath)) { $cfgPath = Join-Path $repo 'tray\dsh-tray.config.json' }
 $cfg = Get-Content -Raw -Encoding UTF8 $cfgPath | ConvertFrom-Json
@@ -82,17 +94,23 @@ Step 'stop legacy tray + dsh'
 foreach ($p in $trayProc) {
   try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; Ok ('stopped tray pid ' + $p.ProcessId) } catch { Warn ('could not stop tray pid ' + $p.ProcessId) }
 }
-$killCmd = 'for p in $(ss -lntpH "sport = :' + $port + '" | grep -oE "pid=[0-9]+" | cut -d= -f2 | sort -u); do kill "$p" 2>/dev/null; done; true'
+# The tray spawned wsl.exe as a child; killing the tray does not kill it, and
+# SIGTERM may be handled (or ignored) by dsh, so the port owner gets SIGKILL.
+# No double quotes here: PowerShell strips them when it rebuilds the argument
+# line for wsl.exe, and a mangled `ss` filter silently kills nothing.
+$killCmd = 'if command -v fuser >/dev/null 2>&1; then fuser -k -KILL -n tcp ' + $port + ' >/dev/null 2>&1; fi; ' +
+           'for p in $(ss -lntp | grep :' + $port + ' | grep -o ''pid=[0-9]*'' | cut -d= -f2 | sort -u); do kill -9 $p >/dev/null 2>&1; done; true'
 [void](Wsl $killCmd)
+
 $deadline = (Get-Date).AddSeconds(20)
+$stillUp = $true
 while ((Get-Date) -lt $deadline) {
-  $c = New-Object System.Net.Sockets.TcpClient
-  try {
-    $ar = $c.BeginConnect('127.0.0.1', $port, $null, $null)
-    if (-not $ar.AsyncWaitHandle.WaitOne(300, $false)) { break }
-    $c.EndConnect($ar)
-  } catch { break } finally { $c.Close() }
+  if (-not (Test-Tcp $port)) { $stillUp = $false; break }
   Start-Sleep -Milliseconds 300
+}
+if ($stillUp) {
+  Warn ('port ' + $port + ' is still listening after the kill; another instance is not ours. Aborting before start.')
+  exit 1
 }
 Ok 'legacy instance is down'
 
@@ -101,6 +119,11 @@ Step ('start ' + $unit)
 $r = Wsl ('systemctl --user start ' + $unit)
 if ($r.Code -ne 0) {
   Warn ('start failed: ' + $r.Text + ' -- run rollback.ps1 if the old layout is still wanted')
+  exit 1
+}
+$state = Wsl ('systemctl --user --no-pager is-active ' + $unit)
+if ($state.Text -ne 'active') {
+  Warn ('unit is ' + $state.Text + '; see: journalctl --user -u ' + $unit)
   exit 1
 }
 $deadline = (Get-Date).AddSeconds(90)

@@ -21,6 +21,7 @@ so quitting or crashing the tray never interrupts a running session, and
           ├─ NotifyIcon（托盘图标）
           ├─ 自绘 WPF 无边框面板（300 DIP，跟随光标定位）
           ├─ systemctl --user start|stop|restart dsh-web   （经 wsl.exe，一次性进程）
+          ├─ keeper：wsl.exe -d <distro> -- /bin/sleep infinity（钉住 VM，见下）
           └─ 读日志尾部取 token → 打开/聚焦浏览器标签
 
 systemd（PID 1）── dsh-web.service ── bash -l ~/bin/dsh-serve.sh ── dsh web --no-open
@@ -28,10 +29,15 @@ systemd（PID 1）── dsh-web.service ── bash -l ~/bin/dsh-serve.sh ─�
                      ~/.local/state/dsh-web.log
 ```
 
-为什么不用「托盘持有 wsl.exe」：WSL2 在最后一个 `wsl.exe` 客户端退出时会回收该会话的
-进程，`setsid`/`nohup` 也救不回来（实测：客户端退出 1 秒内进程消失）。把 dsh 挂在
-systemd 下则不受影响（实测：客户端退出 10 秒后 unit 仍 `active`）。详见
-[`MIGRATION.md`](MIGRATION.md)。
+**为什么还需要一个 keeper**：WSL2 在最后一个 `wsl.exe` 客户端退出约 10–30 秒后回收整个
+发行版，systemd 和所有 unit 一起消失；`loginctl enable-linger` 只保证 user manager 在
+VM 还活着的期间不被回收，救不了 VM 本身。所以托盘额外常驻一个
+`wsl.exe … -- /bin/sleep infinity`（keeper）把 VM 钉住：它与 dsh 不是父子关系，托盘崩溃
+或重启都不影响服务；托盘重启时会复用已有的 keeper，托盘退出且服务已停止时才释放它。
+
+**为什么不让托盘持有 dsh**（旧方案）：那时 `wsl.exe` 是 dsh 的父进程，托盘一死服务就死。
+现在 dsh 的父进程是 systemd，`Restart=on-failure` 还能自愈；keeper 只负责"占位"，不参与
+服务的生命周期。详见 [`MIGRATION.md`](MIGRATION.md)。
 
 | 交互 | 行为 |
 |---|---|
@@ -123,6 +129,7 @@ unit 是 `enable` 的，并且已开启 linger：之后 WSL 发行版一旦启�
 | `-ControllerTest` | 打印将执行的 systemctl 命令、unit 状态（不启停） |
 | `-Render -RenderState running\|starting\|stopping\|stopped\|failed [-RenderReason stop\|port\|token\|linger\|nounit]` | 离屏渲染面板到 `%LOCALAPPDATA%\dsh\panel-*.png` |
 | `-SelfTest` | 跑一轮「停止 → 启动」，量心跳最大间隔，结果写 `selftest.txt` |
+| `-KeeperTest` | 拉起 keeper 并故意留在后台，打印是否存活与端口归属（用于验证 VM 是否被钉住） |
 | `-AnchorTest -AnchorState <s> -CursorX <px> -CursorY <px>` | 打印 DPI 缩放、工作区、面板四边、是否越界 |
 | `-AnimTest` | 采样渐入/渐出透明度与 `IsVisible` |
 | `-ListWindows` / `-FocusTest` | 诊断左键聚焦（枚举窗口 / 真实激活并回读前台 hwnd） |
@@ -151,7 +158,9 @@ unit 是 `enable` 的，并且已开启 linger：之后 WSL 发行版一旦启�
   不匹配就开新标签；日志里 `[boot]` 标记之前的 token 一律视为过期。
 - **`%LOCALAPPDATA%` 下才自洽**：`.vbs`/`.ps1`/图标/文案/配置必须在同一目录。
 - 托盘基于 WPF，常驻约 200–250 MB。
-- Windows 注销/重启会结束 WSL，服务随之停止（未做开机自启；按需双击快捷方式）。
+- **服务存活依赖 keeper 客户端**：`wsl --shutdown`、Windows 注销/重启都会终止它，服务随之
+  停止（这是 WSL 的边界；本方案未做开机自启，按需双击快捷方式即可）。
+- keeper 是常驻的 `sleep infinity`，服务停止但仍开着托盘时它不会主动退出（退出托盘时才释放）。
 
 ## 安全说明
 

@@ -9,8 +9,14 @@
 1. 托盘成了单点故障：WPF 里一个未捕获异常就会连带杀掉服务，进行中的会话直接丢失。
 2. 托盘必须一直活着：重启托盘、注销、换用户都要重来一遍。
 
-systemd 单元不受 `wsl.exe` 会话回收影响（实测：客户端退出 10 秒后 unit 仍 `active`），
-所以让 systemd 持有 `dsh web`，托盘退化成控制器，两个代价同时消失。
+systemd 负责进程管理与自愈（`Restart=on-failure`），但它**不能**让发行版活下来：WSL2 在最后
+一个 `wsl.exe` 客户端退出约 10–30 秒后回收发行版，systemd 与所有 unit 一起消失；
+`loginctl enable-linger` 只让 user manager 在 VM 存活期间不被回收，救不了 VM 本身。
+
+所以托盘另外常驻一个 `wsl.exe … -- /bin/sleep infinity` 客户端（keeper）钉住 VM。它与
+dsh 没有父子关系，只负责"占位"，因此托盘崩溃/重启不再影响服务；托盘重启时复用已有的
+keeper，托盘退出且服务已停止时才释放它。这一步是上线后根据实际故障补上的（见
+[`改进方案`](../dsh-wsl-tray-改进方案.md) 第 15 节）。
 
 ## 迁移前检查
 
@@ -82,7 +88,8 @@ pwsh -ExecutionPolicy Bypass -File tools\rollback.ps1 -Backup <dir>  # 指定备
 | 托盘退出 | 服务停止 | 服务继续 |
 | 托盘崩溃 | 服务停止 | 服务继续 |
 | dsh 崩溃 | 面板变灰，不自动拉起 | `Restart=on-failure` 3 秒后自动重启 |
-| Windows 注销 | 服务停止 | 服务继续（linger）；发行版被 `wsl --shutdown` 时才停 |
+| Windows 注销 | 服务停止 | 服务停止（keeper 随会话结束） |
+| 发行版存活 | 托盘的前台 `wsl.exe`（同时持有 dsh） | keeper 常驻客户端（只占位，不持有 dsh） |
 | 停止方式 | `pkill -f 'dsh web'`（会误伤） | `systemctl --user stop`（精确） |
 | 日志 | 每次启动截断 | 追加，托盘只读尾部，靠 `[boot]` 标记判新旧 |
 | 端口 | 脚本里 6 处硬编码 | 配置文件一处 + `dsh-serve.sh` |

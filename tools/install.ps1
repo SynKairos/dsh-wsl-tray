@@ -108,6 +108,22 @@ if (-not $SkipShortcut) {
 # --- deployment record ------------------------------------------------------
 $git = ''
 try { $git = (& git -C $repo rev-parse --short HEAD 2>$null) } catch { }
+if (-not $git) {
+  # git on a UNC work tree can refuse ("dubious ownership"); read the ref directly
+  # so deployed.json still records which revision was installed.
+  try {
+    $headFile = Join-Path $repo '.git\HEAD'
+    if (Test-Path $headFile) {
+      $head = (Get-Content -Raw $headFile).Trim()
+      if ($head -match '^ref:\s*(.+)$') {
+        $refFile = Join-Path $repo ('.git\' + ($Matches[1] -replace '/', '\'))
+        if (Test-Path $refFile) { $git = (Get-Content -Raw $refFile).Trim().Substring(0, 7) }
+      } elseif ($head -match '^[0-9a-f]{40}') {
+        $git = $head.Substring(0, 7)
+      }
+    }
+  } catch { }
+}
 $files = @{}
 foreach ($f in @('dsh-tray.ps1', 'dsh-tray.vbs', 'dsh-labels.json', 'dsh-tray.config.json')) {
   $p = Join-Path $Root $f

@@ -18,6 +18,7 @@ param(
   [switch]$TokenTest,
   [switch]$ConfigTest,
   [switch]$ControllerTest,
+  [switch]$KeeperTest,
   [switch]$BenchPanel
 )
 
@@ -37,7 +38,7 @@ Add-Type -AssemblyName System.Drawing
 # script: port, bind host, distro, account, systemd unit, log path, timeouts.
 # Nothing below may hardcode any of them.
 # Diagnostics must never block on a modal dialog: they run from scripts.
-$script:Headless = [bool]($Render -or $ConfigTest -or $ControllerTest -or $ListWindows -or
+$script:Headless = [bool]($Render -or $ConfigTest -or $ControllerTest -or $KeeperTest -or $ListWindows -or
   $FocusTest -or $AnimTest -or $SelfTest -or $TokenTest -or $BenchPanel -or $AnchorTest -or $Probe -gt 0)
 
 $Root = if ($env:DSH_TRAY_ROOT) { $env:DSH_TRAY_ROOT } else { Join-Path $env:LOCALAPPDATA 'dsh' }
@@ -192,6 +193,14 @@ $script:OpOpen     = $false
 $script:OpTimer    = $null
 $script:OpStdout   = $null
 $script:OpStderr   = $null
+# WSL2 reclaims the distro about ten seconds after the last wsl.exe client on the
+# Windows side exits, taking the user systemd manager and every unit with it.
+# Linger does not help: it keeps the manager, not the VM. This client runs
+# `sleep infinity` and exists only to hold the VM while the service should live.
+$script:Keeper     = $null
+$script:KeeperOut  = $null
+$script:KeeperErr  = $null
+$script:KeeperPid  = 0
 try { $script:AnimOk = [System.Windows.SystemParameters]::ClientAreaAnimation } catch { $script:AnimOk = $true }
 
 # Brushes / fonts / logo are rebuilt on every panel refresh otherwise, and each
@@ -713,10 +722,80 @@ function Get-WslOutput([System.Diagnostics.Process]$P) {
   return $text
 }
 
+# A keeper spawns its own pipes and must not touch $script:OpStdout/OpStderr,
+# otherwise a systemctl call issued later would read the keeper's never-finishing
+# stream instead of its own output.
+function New-KeeperProcess([string]$Arguments) {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = 'C:\Windows\System32\wsl.exe'
+  $psi.Arguments = $Arguments
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $script:KeeperOut = $p.StandardOutput.ReadToEndAsync()
+  $script:KeeperErr = $p.StandardError.ReadToEndAsync()
+  return $p
+}
+
+# Keeper pids are found through CIM, which can take most of a second. The result
+# is cached so only a tray restart (or a lost keeper) pays that cost.
+function Get-KeeperPids {
+  $found = @()
+  try {
+    foreach ($p in (Get-CimInstance -ClassName Win32_Process -Filter "Name='wsl.exe'" -ErrorAction Stop)) {
+      $cl = [string]$p.CommandLine
+      if ($cl -and $cl -like '*sleep*infinity*' -and $cl -like ('*' + $script:Distro + '*')) { $found += [int]$p.ProcessId }
+    }
+  } catch { }
+  return $found
+}
+
+function Test-KeeperPid([int]$ProcessId) {
+  if (-not $ProcessId) { return $false }
+  try { return -not (Get-Process -Id $ProcessId -ErrorAction Stop).HasExited } catch { return $false }
+}
+
+# Is a keeper from another tray already holding the VM? Without this check a
+# tray restart would leave one orphan client per restart, and no later exit could
+# ever let the distro shut down.
+function Test-KeeperAlive {
+  $found = @(Get-KeeperPids)
+  if ($found.Count -gt 0) {
+    $script:KeeperPid = $found[0]
+    return $true
+  }
+  return $false
+}
+
+function Ensure-Keeper {
+  if ($script:Keeper) {
+    try { if (-not $script:Keeper.HasExited) { return $true } } catch { }
+    $script:Keeper = $null
+  }
+  # Cheap path first: the pid already known from a previous call or tray.
+  if (Test-KeeperPid $script:KeeperPid) { return $true }
+  if (Test-KeeperAlive) {
+    Write-TrayLog ('keeper: already held by another client pid=' + $script:KeeperPid)
+    return $true
+  }
+  try {
+    $script:Keeper = New-KeeperProcess ($WslBase + '/bin/sleep infinity')
+    $script:KeeperPid = $script:Keeper.Id
+    Write-TrayLog ('keeper: spawned pid=' + $script:KeeperPid)
+    return $true
+  } catch {
+    Write-TrayLog ('keeper: spawn failed: ' + $_.Exception.Message) 'error'
+    $script:Keeper = $null
+    $script:KeeperPid = 0
+    return $false
+  }
+}
+
 # Short synchronous call for diagnostics (`is-active`, `status`). Never used on
 # the 3 s poll path, because every wsl.exe spawn costs a process hand-off.
-function Invoke-Systemctl([string]$Verb) {
-  $p = $null
+function Invoke-Systemctl([string]$Verb) {  $p = $null
   try {
     $p = New-WslProcess ($WslBase + 'systemctl --user --no-pager ' + $Verb + ' ' + $script:Unit)
     if (-not $p.WaitForExit(8000)) { try { $p.Kill() } catch { }; return @{ Code = -1; Text = 'timeout after 8000ms' } }
@@ -825,6 +904,9 @@ function Update-Op {
 
 function Begin-Start {
   if ($script:OpKind) { return $false }
+  # Hold the VM before talking to systemd: the start call itself is a short-lived
+  # client, and a distro with no client left is reclaimed mid-boot.
+  [void](Ensure-Keeper)
   $p = Get-PortState
   if ($p -eq 'dsh') {
     $script:State = 'running'
@@ -1228,6 +1310,19 @@ function Show-Panel {
 function Exit-App {
   Write-TrayLog 'exit requested'
   if ($script:OpProc) { try { if (-not $script:OpProc.HasExited) { $script:OpProc.Kill() } } catch { } }
+  # The unit is meant to outlive the tray, and it can only do that while some
+  # client holds the VM. If nothing is serving there is nothing to hold, so the
+  # keeper goes away and the distro is free to shut down.
+  if ((-not (Test-Up)) -and (-not $script:OpKind)) {
+    foreach ($kp in @(Get-KeeperPids)) {
+      try { Stop-Process -Id $kp -Force -ErrorAction Stop; Write-TrayLog ('keeper: released pid=' + $kp) } catch { }
+    }
+    if ($script:Keeper) { try { if (-not $script:Keeper.HasExited) { $script:Keeper.Kill() } } catch { } }
+    $script:Keeper = $null
+    $script:KeeperPid = 0
+  } else {
+    Write-TrayLog 'keeper: left running (service still up or op in flight)'
+  }
   if ($script:Tray) { $script:Tray.Visible = $false; $script:Tray.Dispose() }
   if ($script:Panel) { $script:Panel.Close() }
   if ($script:Mutex) { try { $script:Mutex.ReleaseMutex() } catch { } }
@@ -1320,6 +1415,23 @@ if ($AnchorTest) {
 
 if ($Probe -gt 0) {
   Write-Output ('port ' + $Probe + ' = ' + (Get-PortState -Port $Probe))
+  exit 0
+}
+
+# Keeper probe: spawn the VM-holding client and exit without killing it, so an
+# outside observer can tell whether the distro survives once the spawning process
+# is gone. Leaves the keeper behind on purpose.
+if ($KeeperTest) {
+  $ok = Ensure-Keeper
+  Start-Sleep -Seconds 3
+  $alive = $false
+  $kid = 0
+  if ($script:Keeper) {
+    try { $alive = -not $script:Keeper.HasExited; $kid = $script:Keeper.Id } catch { }
+  }
+  Write-Output ('keeper_started=' + $ok)
+  Write-Output ('keeper_alive=' + $alive + ' pid=' + $kid)
+  Write-Output ('port=' + (Get-PortState))
   exit 0
 }
 
@@ -1516,6 +1628,8 @@ try {
 
 if ($NoStart) {
   Write-TrayLog 'NoStart: not touching the service'
+  # Still hold the VM: an already-running unit dies with the distro otherwise.
+  [void](Ensure-Keeper)
   if (Test-Up) { $script:State = 'running'; $script:PortKind = 'dsh' }
 } else {
   [void](Begin-Start)
@@ -1574,6 +1688,14 @@ $timer.Interval = [TimeSpan]::FromSeconds([Math]::Max(1, $script:PollSeconds))
 $timer.add_Tick({
   if ($script:OpKind) { return }
   if ($script:Prewarming) { return }
+  # The keeper is what keeps the VM (and therefore the unit) alive: without it
+  # the distro is reclaimed about ten seconds later. Re-acquire it if it died
+  # while the service is still supposed to be up.
+  if ($script:KeeperPid -gt 0 -and -not (Test-KeeperPid $script:KeeperPid)) {
+    $script:KeeperPid = 0
+    Write-TrayLog 'keeper: lost' 'warn'
+  }
+  if ($script:KeeperPid -eq 0 -and (Test-Up)) { [void](Ensure-Keeper) }
   $before = Get-PanelKey
   if (Test-Up) {
     if ($script:PortKind -ne 'dsh') {
