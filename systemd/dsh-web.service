@@ -1,0 +1,27 @@
+[Unit]
+Description=DeepSeek Harness Web GUI (dsh web)
+Documentation=https://github.com/SynKairos/dsh-wsl-tray
+# The service is independent of any terminal: it keeps running when the tray
+# exits, when the last wsl.exe client disconnects (linger) and across reboots
+# (once the distro boots and the unit is enabled).
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=DSH_WORKSPACE=%h/dsh-workspace
+Environment=DSH_PORT=3080
+Environment=PATH=%h/.local/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash -l %h/bin/dsh-serve.sh
+# Restart only on failure: a deliberate `systemctl stop` must stay stopped.
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+# Append (never truncate): the tray reads the tail of this file for the token,
+# and a restart must not throw away the previous run's log.
+StandardOutput=append:%h/.local/state/dsh-web.log
+StandardError=append:%h/.local/state/dsh-web.log
+
+[Install]
+WantedBy=default.target

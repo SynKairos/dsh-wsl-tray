@@ -1,6 +1,7 @@
 param(
-  [string]$Distro       = 'Ubuntu-24.04',
+  [string]$Distro       = '',
   [string]$User         = '',
+  [string]$ConfigFile   = '',
   [switch]$Render,
   [switch]$NoStart,
   [string]$RenderState  = 'running',
@@ -15,6 +16,8 @@ param(
   [switch]$AnimTest,
   [switch]$SelfTest,
   [switch]$TokenTest,
+  [switch]$ConfigTest,
+  [switch]$ControllerTest,
   [switch]$BenchPanel
 )
 
@@ -29,18 +32,110 @@ Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# No machine-specific constants below: the install root follows the Windows
-# per-user profile, and the distro account defaults to the Windows account name
-# lowercased (override with -User when the two differ).
-$Root = Join-Path $env:LOCALAPPDATA 'dsh'
-if (-not $User) { $User = $env:USERNAME.ToLower() }
+# --- configuration -----------------------------------------------------------
+# Every machine-specific value lives in dsh-tray.config.json next to this
+# script: port, bind host, distro, account, systemd unit, log path, timeouts.
+# Nothing below may hardcode any of them.
+# Diagnostics must never block on a modal dialog: they run from scripts.
+$script:Headless = [bool]($Render -or $ConfigTest -or $ControllerTest -or $ListWindows -or
+  $FocusTest -or $AnimTest -or $SelfTest -or $TokenTest -or $BenchPanel -or $AnchorTest -or $Probe -gt 0)
+
+$Root = if ($env:DSH_TRAY_ROOT) { $env:DSH_TRAY_ROOT } else { Join-Path $env:LOCALAPPDATA 'dsh' }
+$script:LogFile = Join-Path $Root 'tray.log'
+
+function Write-TrayLog {
+  param([string]$Message, [string]$Level = 'info')
+  try {
+    $line = ('{0:yyyy-MM-dd HH:mm:ss.fff} [{1}] {2}' -f (Get-Date), $Level, $Message)
+    try {
+      if ((Test-Path $script:LogFile) -and ((Get-Item $script:LogFile).Length -gt 1MB)) {
+        Move-Item -Force $script:LogFile ($script:LogFile + '.1')
+      }
+    } catch { }
+    [System.IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine)
+  } catch { }
+}
+
+$script:Defaults = [ordered]@{
+  schema              = 1
+  distro              = 'Ubuntu-24.04'
+  user                = ''
+  host                = '127.0.0.1'
+  port                = 3080
+  unit                = 'dsh-web'
+  logPath             = '~/.local/state/dsh-web.log'
+  stopConfirm         = $true
+  startTimeoutSeconds = 90
+  stopTimeoutSeconds  = 25
+  pollSeconds         = 3
+  focusBrowser        = $true
+}
+
+function Read-TrayConfig {
+  param([string]$Path)
+  if (-not (Test-Path $Path)) { throw ('config not found: ' + $Path) }
+  $raw = Get-Content -Raw -Encoding UTF8 $Path | ConvertFrom-Json
+  $cfg = [ordered]@{}
+  foreach ($k in $script:Defaults.Keys) { $cfg[$k] = $script:Defaults[$k] }
+  foreach ($p in $raw.PSObject.Properties) {
+    if ($script:Defaults.Contains($p.Name)) { $cfg[$p.Name] = $p.Value }
+    else { Write-TrayLog ('config: unknown key ignored: ' + $p.Name) 'warn' }
+  }
+  if (-not $cfg.distro) { throw 'config: distro must not be empty' }
+  if ([int]$cfg.port -lt 1 -or [int]$cfg.port -gt 65535) { throw ('config: port out of range: ' + $cfg.port) }
+  if ($cfg.unit -notmatch '^[A-Za-z0-9_.@-]+$') { throw ('config: illegal unit name: ' + $cfg.unit) }
+  if ($cfg.host -notmatch '^[A-Za-z0-9.:\[\]-]+$') { throw ('config: illegal host: ' + $cfg.host) }
+  if (-not $cfg.logPath) { throw 'config: logPath must not be empty' }
+  return $cfg
+}
+
+if (-not $ConfigFile) { $ConfigFile = Join-Path $Root 'dsh-tray.config.json' }
+try {
+  $C = Read-TrayConfig $ConfigFile
+} catch {
+  Write-TrayLog ('fatal config: ' + $_.Exception.Message) 'error'
+  Write-Output ('fatal config: ' + $_.Exception.Message)
+  if (-not $script:Headless) {
+    [void][System.Windows.MessageBox]::Show(('Bad tray config:' + [Environment]::NewLine + $ConfigFile + [Environment]::NewLine + [Environment]::NewLine + $_.Exception.Message + [Environment]::NewLine + [Environment]::NewLine + 'See ' + $script:LogFile), 'DeepSeek Harness', 'OK', 'Error')
+  }
+  exit 1
+}
+# Command-line parameters win over the file, so a one-off run can point elsewhere.
+if ($Distro) { $C.distro = $Distro }
+if ($User)   { $C.user   = $User }
+if (-not $C.user) { $C.user = $env:USERNAME.ToLower() }
+
+$script:Distro    = [string]$C.distro
+$script:LinuxUser = [string]$C.user
+$script:Port      = [int]$C.port
+$script:BindHost  = [string]$C.host
+$script:Unit      = [string]$C.unit
+$script:BaseUrl   = 'http://' + $script:BindHost + ':' + $script:Port + '/'
+$script:StopConfirm = [bool]$C.stopConfirm
+$script:StartTimeout = [int]$C.startTimeoutSeconds
+$script:StopTimeout  = [int]$C.stopTimeoutSeconds
+$script:PollSeconds  = [int]$C.pollSeconds
+
+$LinuxHome = '/home/' + $script:LinuxUser
+$LogLinux  = ([string]$C.logPath).Replace('~', $LinuxHome)
+$LogUnc    = '\\wsl.localhost\' + $script:Distro + ($LogLinux -replace '/', '\')
+$WslBase   = '-d ' + $script:Distro + ' -u ' + $script:LinuxUser + ' -- '
+$LogArgs   = $WslBase + 'bash -l ' + $LinuxHome + '/bin/dsh-log.sh'
+
+Write-TrayLog ('start pid=' + $PID + ' config=' + $ConfigFile)
+Write-TrayLog ('resolved distro=' + $script:Distro + ' user=' + $script:LinuxUser + ' port=' + $script:Port + ' unit=' + $script:Unit)
+
 $IcoPath   = Join-Path $Root 'dsh-icon.ico'
 $LabelFile = Join-Path $Root 'dsh-labels.json'
-$LogUnc    = "\\wsl.localhost\$Distro\home\$User\.local\state\dsh-web.log"
-$RunArgs   = "-d $Distro -u $User -- bash -l /home/$User/bin/dsh-run.sh --no-browser"
-$StopArgs  = "-d $Distro -u $User -- bash -l /home/$User/bin/dsh-stop.sh"
-$LogArgs   = "-d $Distro -u $User -- bash -l /home/$User/bin/dsh-log.sh"
-$L         = Get-Content -Raw -Encoding UTF8 $LabelFile | ConvertFrom-Json
+if (-not (Test-Path $LabelFile)) {
+  Write-TrayLog ('fatal: labels file missing: ' + $LabelFile) 'error'
+  Write-Output ('fatal: labels file missing: ' + $LabelFile)
+  if (-not $script:Headless) {
+    [void][System.Windows.MessageBox]::Show(('Missing labels file:' + [Environment]::NewLine + $LabelFile), 'DeepSeek Harness', 'OK', 'Error')
+  }
+  exit 1
+}
+$L = Get-Content -Raw -Encoding UTF8 $LabelFile | ConvertFrom-Json
 
 # Palette taken from the official design tokens shipped inside dsh itself
 # (@deepseek-ai/dsh-client-ui-theme -> --dsw-static-*), so the panel matches the
@@ -66,7 +161,6 @@ $C_Glyph  = '#CFD3D6'
 $FontCN   = 'Microsoft YaHei UI'
 $FontIcon = 'Segoe MDL2 Assets'
 
-$script:Proc      = $null
 $script:State     = 'stopped'
 $script:Reason    = ''
 $script:Panel     = $null
@@ -85,6 +179,9 @@ $script:HideWait      = $null
 $script:HidePendingGen = 0
 $script:ShownKey   = ''
 $script:PortKind   = 'free'
+# A non-dsh listener cannot become dsh without disappearing first, so the
+# expensive HTTP identity probe is skipped until this moment.
+$script:ForeignUntil = [DateTime]::MinValue
 # One start/stop at a time, driven by a dispatcher timer instead of a blocking
 # wait on the click handler: the UI thread must stay free to repaint the panel.
 $script:OpKind     = ''
@@ -92,8 +189,9 @@ $script:OpProc     = $null
 $script:OpDeadline = [DateTime]::MinValue
 $script:OpNext     = ''
 $script:OpOpen     = $false
-$script:OpMiss     = 0
 $script:OpTimer    = $null
+$script:OpStdout   = $null
+$script:OpStderr   = $null
 try { $script:AnimOk = [System.Windows.SystemParameters]::ClientAreaAnimation } catch { $script:AnimOk = $true }
 
 # Brushes / fonts / logo are rebuilt on every panel refresh otherwise, and each
@@ -221,11 +319,12 @@ function Focus-Window([IntPtr]$h) {
 }
 
 function Test-Up {
-  param([int]$TimeoutMs = 500)
+  param([int]$Port = 0, [int]$TimeoutMs = 500)
+  if (-not $Port) { $Port = $script:Port }
   $c = $null
   try {
     $c = New-Object System.Net.Sockets.TcpClient
-    $r = $c.BeginConnect('127.0.0.1', 3080, $null, $null)
+    $r = $c.BeginConnect($script:BindHost, $Port, $null, $null)
     $ok = $r.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
     if ($ok) { $c.EndConnect($r) }
     return $ok
@@ -233,13 +332,14 @@ function Test-Up {
   finally { if ($c) { try { $c.Close() } catch { } } }
 }
 
-# HTTP status of 127.0.0.1:Port. 401/303/200/302 => dsh is the listener.
+# HTTP status of the configured listener. 401/303 => dsh is the listener.
 # -2 => nothing answered on HTTP (treated as foreign or closed).
 function Test-DshHttp {
-  param([int]$Port = 3080, [int]$TimeoutMs = 1500)
+  param([int]$Port = 0, [int]$TimeoutMs = 1500)
+  if (-not $Port) { $Port = $script:Port }
   $req = $null
   try {
-    $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/")
+    $req = [System.Net.HttpWebRequest]::Create('http://' + $script:BindHost + ':' + $Port + '/')
     $req.Proxy = $null
     $req.Timeout = $TimeoutMs
     $req.ReadWriteTimeout = $TimeoutMs
@@ -263,20 +363,9 @@ function Test-DshHttp {
 
 # 'free' | 'dsh' | 'foreign'
 function Get-PortState {
-  param([int]$Port = 3080, [int]$TimeoutMs = 1500)
-  $ok = $false
-  $c = $null
-  try {
-    $c = New-Object System.Net.Sockets.TcpClient
-    $r = $c.BeginConnect('127.0.0.1', $Port, $null, $null)
-    $ok = $r.AsyncWaitHandle.WaitOne(500, $false)
-    if ($ok) { $c.EndConnect($r) }
-  } catch {
-    $ok = $false
-  } finally {
-    if ($c) { try { $c.Close() } catch { } }
-  }
-  if (-not $ok) { return 'free' }
+  param([int]$Port = 0, [int]$TimeoutMs = 1500)
+  if (-not $Port) { $Port = $script:Port }
+  if (-not (Test-Up -Port $Port -TimeoutMs 500)) { return 'free' }
   $code = Test-DshHttp -Port $Port -TimeoutMs $TimeoutMs
   # dsh answers 401 on an unauthenticated GET / (measured 2026-11-24, 0.2.2-rc.5).
   # 303 only appears with a valid token. A generic 200 is NOT proof of dsh.
@@ -284,28 +373,51 @@ function Get-PortState {
   return 'foreign'
 }
 
-# Single read of the log over the 9p share. Returns $null when the share is
-# unreachable or the token line is not there yet.
-function Read-TokenFromUnc {
+# --- token plumbing ----------------------------------------------------------
+# dsh prints one `dsh web: http://...?token=...` line per process and the token
+# is fresh on every start. Only the tail of the log is read: the file is
+# append-only, so reading it whole would make every click slower over time.
+$script:TailBytes = 65536
+
+function Read-LogText {
   try {
     if (-not (Test-Path $LogUnc)) { return $null }
-    $lines = Get-Content $LogUnc -ErrorAction Stop
-    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
-      $m = [regex]::Match($lines[$i], 'token=([A-Za-z0-9_\-]+)')
-      if ($m.Success) { return $m.Groups[1].Value }
-    }
-  } catch { }
+    $fs = [System.IO.File]::Open($LogUnc, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+      $len = $fs.Length
+      $start = [Math]::Max(0, $len - $script:TailBytes)
+      [void]$fs.Seek($start, [System.IO.SeekOrigin]::Begin)
+      $count = [int]($len - $start)
+      $buf = New-Object byte[] $count
+      $read = $fs.Read($buf, 0, $count)
+      return [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+    } finally { $fs.Dispose() }
+  } catch { return $null }
+}
+
+# Newest token, but only when it belongs to the current run: the launcher writes
+# a `[boot]` marker before dsh starts, so a token below the last marker is stale
+# and must not be turned into a browser tab that answers 401.
+function Get-TokenFromText {
+  param([string]$Text)
+  if (-not $Text) { return $null }
+  $lines = $Text -split "`r?`n"
+  for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+    if ($lines[$i] -match '\[boot\]') { return $null }
+    $m = [regex]::Match($lines[$i], 'token=([A-Za-z0-9_\-]+)')
+    if ($m.Success) { return $m.Groups[1].Value }
+  }
   return $null
 }
 
-# Fallback when the share itself is missing: read the same file inside the distro.
-# Output is drained asynchronously so a large log cannot block the UI thread.
+# Fallback when the share itself is missing: tail the same file inside the
+# distro. Output is drained asynchronously so a large log cannot block the UI.
 function Read-TokenFromWsl {
   $p = $null
   try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'C:\Windows\System32\wsl.exe'
-    $psi.Arguments = "-d $Distro -u $User -- /bin/cat /home/$User/.local/state/dsh-web.log"
+    $psi.Arguments = $WslBase + 'tail -c ' + $script:TailBytes + ' -- ' + $LogLinux
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -317,26 +429,20 @@ function Read-TokenFromWsl {
       try { $p.Kill() } catch { }
       return $null
     }
-    $text = ''
-    if ($out.IsCompleted) { $text = $out.Result }
-    $lines = $text -split "`r?`n"
-    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
-      $m = [regex]::Match($lines[$i], 'token=([A-Za-z0-9_\-]+)')
-      if ($m.Success) { return $m.Groups[1].Value }
-    }
-  } catch { }
+    if (-not $out.IsCompleted) { return $null }
+    return (Get-TokenFromText $out.Result)
+  } catch { return $null }
   finally { if ($p) { try { $p.Dispose() } catch { } } }
-  return $null
 }
 
 function Get-Token {
   param([switch]$Robust)
-  $t = Read-TokenFromUnc
+  $t = Get-TokenFromText (Read-LogText)
   if ($t) { return $t }
   if (-not $Robust) { return $null }
   # A 9p hiccup looks exactly like a missing token; retry once before falling back.
   Start-Sleep -Milliseconds 250
-  $t = Read-TokenFromUnc
+  $t = Get-TokenFromText (Read-LogText)
   if ($t) { return $t }
   return (Read-TokenFromWsl)
 }
@@ -514,6 +620,8 @@ function New-Panel {
     $hint  = $L.hintStartFail
     if ($Reason -eq 'port')  { $hint = $L.hintPortBusy }
     if ($Reason -eq 'token') { $hint = $L.hintNoToken }
+    if ($Reason -eq 'linger') { $hint = $L.hintLinger }
+    if ($Reason -eq 'nounit') { $hint = $L.hintNoUnit }
     if ($Reason -eq 'stop')  {
       $hint = $L.hintStopFail
       if ($L.statusStopFailed) { $label = $L.statusStopFailed }
@@ -524,7 +632,7 @@ function New-Panel {
   [void]$st.Children.Add($dot)
   $pad = New-Object System.Windows.Controls.Border; $pad.Width = 6
   [void]$st.Children.Add($pad)
-  [void]$st.Children.Add((New-Text -Text ($label + '   ' + $L.dotSep + '   127.0.0.1:3080') -Size 10.5 -Color $C_Sub))
+  [void]$st.Children.Add((New-Text -Text ($label + '   ' + $L.dotSep + '   ' + $script:BindHost + ':' + $script:Port) -Size 10.5 -Color $C_Sub))
   [void]$txt.Children.Add($st)
 
   if ($hint) {
@@ -547,7 +655,7 @@ function New-Panel {
 
   [void]$outer.Children.Add((New-Row -Glyph 'E8A7' -Label $L.menuOpen    -OnClick { Open-UI }))
   [void]$outer.Children.Add((New-Row -Glyph 'E72C' -Label $L.menuRestart -OnClick { Restart-Server }))
-  [void]$outer.Children.Add((New-Row -Glyph 'E71A' -Label $L.menuStop    -OnClick { Stop-Server }))
+  [void]$outer.Children.Add((New-Row -Glyph 'E71A' -Label $L.menuStop    -OnClick { Confirm-Stop }))
   if ($State -eq 'failed') {
     [void]$outer.Children.Add((New-Row -Glyph 'E7C3' -Label $L.menuLog -OnClick { Open-Log }))
   }
@@ -575,9 +683,11 @@ function Open-Log {
   }
 }
 
-# --- non-blocking start/stop ------------------------------------------------
-# Everything below runs on the dispatcher thread, so it must only spawn work and
-# return. Polling happens in Update-Op on the op timer (400 ms).
+# --- non-blocking service control -------------------------------------------
+# The service belongs to systemd (a user unit), not to this tray: quitting or
+# crashing the tray must not stop dsh, and `Restart=on-failure` in the unit
+# covers a dsh crash. Every operation spawns `wsl.exe ... systemctl --user`
+# without waiting; Update-Op polls the process and the port on the op timer.
 
 function New-WslProcess([string]$Arguments) {
   $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -587,7 +697,33 @@ function New-WslProcess([string]$Arguments) {
   $psi.CreateNoWindow = $true
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
-  return [System.Diagnostics.Process]::Start($psi)
+  $p = [System.Diagnostics.Process]::Start($psi)
+  # Drain both pipes: a redirected pipe that nobody reads blocks wsl.exe once
+  # the buffer fills, which used to look like a start that never finished.
+  $script:OpStdout = $p.StandardOutput.ReadToEndAsync()
+  $script:OpStderr = $p.StandardError.ReadToEndAsync()
+  return $p
+}
+
+function Get-WslOutput([System.Diagnostics.Process]$P) {
+  $parts = @()
+  try { if ($script:OpStdout -and $script:OpStdout.IsCompleted) { $parts += $script:OpStdout.Result.Trim() } } catch { }
+  try { if ($script:OpStderr -and $script:OpStderr.IsCompleted) { $parts += $script:OpStderr.Result.Trim() } } catch { }
+  $text = (($parts | Where-Object { $_ }) -join ' | ')
+  return $text
+}
+
+# Short synchronous call for diagnostics (`is-active`, `status`). Never used on
+# the 3 s poll path, because every wsl.exe spawn costs a process hand-off.
+function Invoke-Systemctl([string]$Verb) {
+  $p = $null
+  try {
+    $p = New-WslProcess ($WslBase + 'systemctl --user --no-pager ' + $Verb + ' ' + $script:Unit)
+    if (-not $p.WaitForExit(8000)) { try { $p.Kill() } catch { }; return @{ Code = -1; Text = 'timeout after 8000ms' } }
+    return @{ Code = $p.ExitCode; Text = (Get-WslOutput $p) }
+  } catch {
+    return @{ Code = -2; Text = $_.Exception.Message }
+  } finally { if ($p) { try { $p.Dispose() } catch { } } }
 }
 
 function Start-OpTimer {
@@ -610,19 +746,18 @@ function Complete-Start([bool]$Ok, [string]$Why = '') {
   $script:OpKind = ''
   Stop-OpTimer
   if ($Ok) {
-    $script:Proc = $p
     $script:State = 'running'
     $script:Reason = ''
     $script:PortKind = 'dsh'
   } else {
     if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
-    $script:Proc = $null
     $script:State = 'failed'
     $r = $Why
     if (-not $r) { if (Test-Up) { $r = 'token' } else { $r = 'start'; $script:PortKind = 'free' } }
     $script:Reason = $r
   }
   $script:OpProc = $null
+  Write-TrayLog ('start -> ok=' + $Ok + ' reason=' + $script:Reason)
   Update-PanelContent
   if ($Ok -and $open) { Open-Browser }
 }
@@ -634,7 +769,6 @@ function Complete-Stop([bool]$Ok) {
   $script:OpKind = ''
   Stop-OpTimer
   if ($Ok) {
-    $script:Proc = $null
     $script:State = 'stopped'
     $script:Reason = ''
     $script:PortKind = 'free'
@@ -643,6 +777,7 @@ function Complete-Stop([bool]$Ok) {
     $script:Reason = 'stop'
     $script:PortKind = 'dsh'
   }
+  Write-TrayLog ('stop -> ok=' + $Ok)
   Update-PanelContent
   if ($Ok -and $next -eq 'start') { [void](Begin-Start) }
 }
@@ -652,24 +787,39 @@ function Update-Op {
   $now = [DateTime]::Now
   if ($script:OpKind -eq 'start') {
     if (Test-Up -TimeoutMs 250) {
-      $script:OpMiss = 0
-      # Readiness is the HTTP signature of dsh, not the token file: the 9p share is
-      # the least reliable link in the chain and must stay off the polling path.
+      # Readiness is the HTTP signature of dsh, not the token file: the 9p share
+      # is the least reliable link in the chain and stays off the polling path.
       $code = Test-DshHttp -TimeoutMs 700
       if ($code -eq 401 -or $code -eq 303) { Complete-Start $true; return }
       if ($code -ne -2) { Complete-Start $false 'port'; return }
-    } else {
-      $script:OpMiss++
     }
     $exited = $false
     if ($script:OpProc) { try { $exited = $script:OpProc.HasExited } catch { $exited = $true } }
-    if ($exited -and $script:OpMiss -ge 2) { Complete-Start $false; return }
-    if ($now -gt $script:OpDeadline) { Complete-Start $false; return }
+    if ($exited) {
+      $rc = -1
+      try { $rc = $script:OpProc.ExitCode } catch { }
+      $text = Get-WslOutput $script:OpProc
+      if ($rc -ne 0) {
+        Write-TrayLog ('systemctl start failed rc=' + $rc + ' text=' + $text) 'error'
+        $why = 'start'
+        if ($text -match 'Failed to connect to bus|No medium found|Connection refused') { $why = 'linger' }
+        elseif ($text -match 'not be found|not loaded|No such file|Unit .* not found') { $why = 'nounit' }
+        Complete-Start $false $why
+        return
+      }
+      # rc=0 but no listener yet: the unit is Type=simple, dsh still needs a
+      # few seconds before it binds. Keep waiting until the deadline.
+    }
+    if ($now -gt $script:OpDeadline) { Complete-Start $false 'start'; return }
     return
   }
   if ($script:OpKind -eq 'stop') {
     if (-not (Test-Up)) { Complete-Stop $true; return }
-    if ($now -gt $script:OpDeadline) { Complete-Stop $false }
+    if ($now -gt $script:OpDeadline) {
+      $text = Get-WslOutput $script:OpProc
+      Write-TrayLog ('stop timed out text=' + $text) 'warn'
+      Complete-Stop $false
+    }
   }
 }
 
@@ -687,6 +837,7 @@ function Begin-Start {
     $script:State = 'failed'
     $script:Reason = 'port'
     $script:PortKind = 'foreign'
+    Write-TrayLog ('port ' + $script:Port + ' is held by a foreign listener') 'warn'
     Update-PanelContent
     return $false
   }
@@ -694,9 +845,12 @@ function Begin-Start {
   $script:Reason = ''
   $script:PortKind = 'free'
   $script:OpKind = 'start'
-  $script:OpMiss = 0
-  $script:OpDeadline = [DateTime]::Now.AddSeconds(90)
-  try { $script:OpProc = New-WslProcess $RunArgs } catch { $script:OpProc = $null }
+  $script:OpDeadline = [DateTime]::Now.AddSeconds($script:StartTimeout)
+  Write-TrayLog ('systemctl --user start ' + $script:Unit)
+  try { $script:OpProc = New-WslProcess ($WslBase + 'systemctl --user start ' + $script:Unit) } catch {
+    Write-TrayLog ('spawn failed: ' + $_.Exception.Message) 'error'
+    $script:OpProc = $null
+  }
   if (-not $script:OpProc) {
     $script:OpKind = ''
     $script:State = 'failed'
@@ -710,8 +864,8 @@ function Begin-Start {
 }
 
 # Stop first, then wait for the port to actually release. A stop that leaves the
-# port bound must not be reported as success: the next start would silently adopt
-# the old instance.
+# port bound must not be reported as success: the panel would then show a dead
+# service while the next start silently adopts the old instance.
 function Begin-Stop {
   if ($script:OpKind -eq 'stop') { return }
   if ($script:OpKind -eq 'start') {
@@ -722,11 +876,13 @@ function Begin-Stop {
   }
   $script:State = 'stopping'
   $script:Reason = ''
-  if ($script:Proc) { try { if (-not $script:Proc.HasExited) { $script:Proc.Kill() } } catch { } }
-  $script:Proc = $null
   $script:OpKind = 'stop'
-  $script:OpDeadline = [DateTime]::Now.AddSeconds(12)
-  try { $script:OpProc = New-WslProcess $StopArgs } catch { $script:OpProc = $null }
+  $script:OpDeadline = [DateTime]::Now.AddSeconds($script:StopTimeout)
+  Write-TrayLog ('systemctl --user stop ' + $script:Unit)
+  try { $script:OpProc = New-WslProcess ($WslBase + 'systemctl --user stop ' + $script:Unit) } catch {
+    Write-TrayLog ('spawn failed: ' + $_.Exception.Message) 'error'
+    $script:OpProc = $null
+  }
   if (-not (Test-Up)) { Complete-Stop $true; return }
   Start-OpTimer
   Update-PanelContent
@@ -734,8 +890,34 @@ function Begin-Stop {
 
 function Stop-Server { Begin-Stop }
 
+# A modal question, owned by the panel when it exists so it cannot open behind
+# another window. Falls back to the active desktop otherwise.
+function Ask-Confirm([string]$Message, [string]$Fallback) {
+  $msg = $Message
+  if (-not $msg) { $msg = $Fallback }
+  $title = [string]$L.appName
+  $answer = $null
+  if ($script:Panel) {
+    $answer = [System.Windows.MessageBox]::Show($script:Panel, $msg, $title, 'YesNo', 'Warning')
+  } else {
+    $answer = [System.Windows.MessageBox]::Show($msg, $title, 'YesNo', 'Warning')
+  }
+  return ($answer -eq 'Yes')
+}
+
+# Stopping kills in-flight agent turns, so a single stray click must not do it.
+function Confirm-Stop {
+  if (-not $script:StopConfirm) { Stop-Server; return }
+  Hide-Panel
+  if (Ask-Confirm ([string]$L.confirmStop) 'Stop the service? Running agent turns will be aborted.') { Stop-Server }
+}
+
 function Restart-Server {
   if ($script:OpKind -eq 'stop') { return }
+  if ($script:StopConfirm) {
+    Hide-Panel
+    if (-not (Ask-Confirm ([string]$L.confirmRestart) 'Restart the service? Running agent turns will be interrupted.')) { return }
+  }
   $script:OpNext = 'start'
   Begin-Stop
 }
@@ -743,13 +925,15 @@ function Restart-Server {
 function Open-Browser {
   $t = Get-Token -Robust
   if (-not $t) {
+    Write-TrayLog 'no token found in the log tail' 'warn'
     $script:State = 'failed'
     $script:Reason = 'token'
     Show-Panel
     Start-HideTimer 8000
     return
   }
-  Start-Process ("http://127.0.0.1:3080/?token=" + $t)
+  Write-TrayLog 'opening browser tab'
+  Start-Process ($script:BaseUrl + '?token=' + $t)
   Write-LastTokenHash $t
   Hide-Panel
 }
@@ -780,6 +964,7 @@ function Open-UI {
   $script:Reason = ''
   $t = Get-Token -Robust
   if (-not $t) {
+    Write-TrayLog 'no token found in the log tail' 'warn'
     $script:State = 'failed'
     $script:Reason = 'token'
     Show-Panel
@@ -789,15 +974,18 @@ function Open-UI {
   # Reuse the remembered tab only when it was opened with this very token. A tray
   # restart keeps the hash, a dsh restart changes the token and therefore opens a
   # fresh tab instead of focusing a page that will answer 401.
-  $h = Get-TokenHash $t
-  $reuse = ($h -ne '') -and ((Read-LastTokenHash) -eq $h)
+  $reuse = $false
+  if ([bool]$C.focusBrowser) {
+    $h = Get-TokenHash $t
+    $reuse = ($h -ne '') -and ((Read-LastTokenHash) -eq $h)
+  }
   if ($reuse) {
     $w = Find-DshWindow
     if ($w -ne [IntPtr]::Zero) {
       if (Focus-Window $w) { return }
     }
   }
-  Start-Process ("http://127.0.0.1:3080/?token=" + $t)
+  Start-Process ($script:BaseUrl + '?token=' + $t)
   Write-LastTokenHash $t
   Hide-Panel
 }
@@ -1035,12 +1223,11 @@ function Show-Panel {
   Mark 'activate' $swP
 }
 
-# Quitting must not wait on wsl.exe: fire the stop script detached and let the
-# process die on its own. The distro keeps running the script after we exit.
+# Quitting the tray never stops the service: systemd owns it. Killing the
+# in-flight wsl.exe client is enough to release this process.
 function Exit-App {
+  Write-TrayLog 'exit requested'
   if ($script:OpProc) { try { if (-not $script:OpProc.HasExited) { $script:OpProc.Kill() } } catch { } }
-  if ($script:Proc) { try { if (-not $script:Proc.HasExited) { $script:Proc.Kill() } } catch { } }
-  try { [void](New-WslProcess $StopArgs) } catch { }
   if ($script:Tray) { $script:Tray.Visible = $false; $script:Tray.Dispose() }
   if ($script:Panel) { $script:Panel.Close() }
   if ($script:Mutex) { try { $script:Mutex.ReleaseMutex() } catch { } }
@@ -1133,6 +1320,38 @@ if ($AnchorTest) {
 
 if ($Probe -gt 0) {
   Write-Output ('port ' + $Probe + ' = ' + (Get-PortState -Port $Probe))
+  exit 0
+}
+
+# Configuration resolution: prints what every other switch would use, without
+# touching the service. Run it right after editing dsh-tray.config.json.
+if ($ConfigTest) {
+  Write-Output ('config   = ' + $ConfigFile)
+  Write-Output ('distro   = ' + $script:Distro)
+  Write-Output ('user     = ' + $script:LinuxUser)
+  Write-Output ('endpoint = ' + $script:BindHost + ':' + $script:Port)
+  Write-Output ('unit     = ' + $script:Unit)
+  Write-Output ('logunc   = ' + $LogUnc)
+  Write-Output ('logexists= ' + (Test-Path $LogUnc))
+  foreach ($f in @($ConfigFile, $IcoPath, $LabelFile)) {
+    Write-Output ('file     = ' + $f + ' exists=' + (Test-Path $f))
+  }
+  exit 0
+}
+
+# Controller diagnostics: prints the exact commands and the unit state. It does
+# spawn wsl.exe (which boots the distro) but never starts or stops the unit.
+if ($ControllerTest) {
+  Write-Output ('unit       = ' + $script:Unit)
+  Write-Output ('cmd start  = wsl.exe ' + $WslBase + 'systemctl --user start ' + $script:Unit)
+  Write-Output ('cmd stop   = wsl.exe ' + $WslBase + 'systemctl --user stop ' + $script:Unit)
+  $r = Invoke-Systemctl 'is-active'
+  Write-Output ('is-active  = ' + $r.Text + '  (rc=' + $r.Code + ')')
+  $r = Invoke-Systemctl 'is-enabled'
+  Write-Output ('is-enabled = ' + $r.Text + '  (rc=' + $r.Code + ')')
+  $r = Invoke-Systemctl 'status'
+  Write-Output '--- systemctl status ---'
+  Write-Output $r.Text
   exit 0
 }
 
@@ -1296,6 +1515,7 @@ try {
 } catch { $script:PokeEvt = $null }
 
 if ($NoStart) {
+  Write-TrayLog 'NoStart: not touching the service'
   if (Test-Up) { $script:State = 'running'; $script:PortKind = 'dsh' }
 } else {
   [void](Begin-Start)
@@ -1323,6 +1543,15 @@ $script:Tray.add_MouseUp({
 
 $app = New-Object System.Windows.Application
 $app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+# A stray exception in a timer or click handler used to kill the tray with no
+# trace (its console window is hidden). Log it, keep the process alive, and let
+# the poll put the state back on its feet.
+$app.add_DispatcherUnhandledException({
+  param($s, $e)
+  Write-TrayLog ('unhandled: ' + $e.Exception.GetType().Name + ': ' + $e.Exception.Message) 'error'
+  Write-TrayLog ('stack: ' + $e.Exception.StackTrace) 'error'
+  $e.Handled = $true
+})
 
 # warm the panel shortly after the tray icon appears, so the first right click
 # does not pay the lazy WPF / window-creation cost
@@ -1341,16 +1570,28 @@ $script:HideTimer.Interval = [TimeSpan]::FromMilliseconds($script:HideMs)
 $script:HideTimer.add_Tick({ $script:HideTimer.Stop(); $script:HideArmed = $false; Hide-Panel })
 
 $timer = New-Object System.Windows.Threading.DispatcherTimer
-$timer.Interval = [TimeSpan]::FromSeconds(3)
+$timer.Interval = [TimeSpan]::FromSeconds([Math]::Max(1, $script:PollSeconds))
 $timer.add_Tick({
   if ($script:OpKind) { return }
   if ($script:Prewarming) { return }
   $before = Get-PanelKey
   if (Test-Up) {
-    # Probe identity only when it is not already known: a foreign listener makes
-    # the HTTP check burn its full timeout, so steady state must not re-probe.
     if ($script:PortKind -ne 'dsh') {
-      if ((Get-PortState) -eq 'dsh') { $script:PortKind = 'dsh' } else { $script:PortKind = 'foreign' }
+      # A foreign listener that never answers HTTP costs ~2 s of dispatcher time
+      # per probe, so probe it once and trust the negative result until the port
+      # goes away or a minute passes: never burn the UI thread every 3 s.
+      if ($script:ForeignUntil -gt [DateTime]::Now) {
+        $script:PortKind = 'foreign'
+      } else {
+        $code = Test-DshHttp -TimeoutMs 1000
+        if ($code -eq 401 -or $code -eq 303) {
+          $script:PortKind = 'dsh'
+        } else {
+          $script:PortKind = 'foreign'
+          $script:ForeignUntil = [DateTime]::Now.AddSeconds(60)
+          Write-TrayLog ('port ' + $script:Port + ' belongs to a foreign listener (cached for 60s)') 'warn'
+        }
+      }
     }
     if ($script:PortKind -eq 'dsh') {
       if ($script:State -eq 'failed') {
@@ -1373,6 +1614,7 @@ $timer.add_Tick({
     }
   } else {
     $script:PortKind = 'free'
+    $script:ForeignUntil = [DateTime]::MinValue
     if ($script:State -eq 'failed') {
       if ($script:Reason -eq 'port') { $script:State = 'stopped'; $script:Reason = '' }
     } elseif ($script:State -ne 'stopping') {
@@ -1392,4 +1634,11 @@ if ($script:PokeEvt) {
   $poke.Start()
 }
 
-[void]$app.Run()
+try {
+  [void]$app.Run()
+} catch {
+  Write-TrayLog ('fatal: ' + $_.Exception.Message) 'error'
+  Write-TrayLog ('stack: ' + $_.Exception.StackTrace) 'error'
+  [void][System.Windows.MessageBox]::Show(('The tray stopped:' + [Environment]::NewLine + $_.Exception.Message + [Environment]::NewLine + [Environment]::NewLine + 'See ' + $script:LogFile), 'DeepSeek Harness', 'OK', 'Error')
+  exit 1
+}

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "distro": "Ubuntu-24.04",
+  "user": "",
+  "host": "127.0.0.1",
+  "port": 3080,
+  "unit": "dsh-web",
+  "logPath": "~/.local/state/dsh-web.log",
+  "stopConfirm": true,
+  "startTimeoutSeconds": 90,
+  "stopTimeoutSeconds": 25,
+  "pollSeconds": 3,
+  "focusBrowser": true
+}

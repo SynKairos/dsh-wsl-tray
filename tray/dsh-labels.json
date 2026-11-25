@@ -14,8 +14,12 @@
   "menuStop": "停止服务",
   "menuLog": "打开日志",
   "menuExit": "退出托盘",
-  "hintPortBusy": "3080 被其他程序占用，服务未启动",
+  "hintPortBusy": "端口被其他程序占用，服务未启动",
   "hintStartFail": "启动未成功，请查看日志",
   "hintStopFail": "停止未生效，服务仍在运行",
-  "hintNoToken": "未取到访问令牌，请查看日志"
+  "hintNoToken": "未取到访问令牌；请确认日志可读且 printUrl 未被关闭",
+  "hintLinger": "systemd 未运行：请先执行 loginctl enable-linger",
+  "hintNoUnit": "服务单元未安装：请运行 tools/install.ps1",
+  "confirmStop": "停止服务会中断正在进行的会话任务，确定停止？",
+  "confirmRestart": "重启服务会中断正在进行的会话任务，确定重启？"
 }
