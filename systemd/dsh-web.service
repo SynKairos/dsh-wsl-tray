@@ -1,9 +1,11 @@
 [Unit]
 Description=DeepSeek Harness Web GUI (dsh web)
 Documentation=https://github.com/SynKairos/dsh-wsl-tray
-# The service is independent of any terminal: it keeps running when the tray
-# exits, when the last wsl.exe client disconnects (linger) and across reboots
-# (once the distro boots and the unit is enabled).
+# Owned by the tray: started and stopped from its panel, deliberately NOT
+# enabled at boot. linger keeps a user manager alive for as long as the VM
+# lives, so `systemctl --user` works from any client without a login session.
+# The unit outlives a terminal, but not the VM: the tray's keeper is what holds
+# the VM, and it is released when the tray exits.
 After=default.target
 
 [Service]
